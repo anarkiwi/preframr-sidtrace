@@ -73,8 +73,9 @@ make            # produces build/sidtrace
 ```
 
 Build prerequisites: a C++17 compiler, `autoconf`/`automake`/`libtool`,
-`pkg-config`, and `make` (Debian/Ubuntu: `build-essential autoconf automake
-libtool pkg-config`).
+`pkg-config`, `make`, and the `xa` cross-assembler (libsidplayfp assembles its
+PSID driver from `.a65` source at build time). Debian/Ubuntu:
+`build-essential autoconf automake libtool pkg-config xa65`.
 
 `make` (1) applies the bus-trace patch into the pinned submodule, (2) runs
 `autoreconf` + `configure` for static libs, (3) builds `libsidplayfp.a` +
