@@ -93,6 +93,28 @@ int main(int argc, char **argv)
     cfg.forceC64Model    = false;
     cfg.forceSidModel    = false;
 
+    // DETERMINISM: libsidplayfp's default powerOnDelay is
+    // SidConfig::DEFAULT_POWER_ON_DELAY == MAX_POWER_ON_DELAY+1, which is the
+    // sentinel that makes Player::initialise() pick a *random* delay seeded from
+    // std::time(nullptr) (see player.cpp). A different power-on delay means a
+    // different number of warm-up clocks before the play routine runs, so the
+    // boot lag and the whole trace length drift run-to-run (the .sidwr.bin size
+    // was observed to vary by ~kB and occasionally collapse to almost nothing).
+    // Pinning powerOnDelay to a fixed value <= MAX_POWER_ON_DELAY takes the
+    // deterministic branch, so every run starts from byte-identical C64 state.
+    // The C64 RAM power-up pattern (SystemRAMBank::reset) and the dangling-bus
+    // LCG (MMU, fixed seed 3686734) are already deterministic, so this is the
+    // sole remaining source of run-to-run variation. Overridable for
+    // experiments via SIDTRACE_POWER_ON_DELAY.
+    {
+        unsigned long pod = 0;
+        if (const char *e = getenv("SIDTRACE_POWER_ON_DELAY"))
+            pod = strtoul(e, nullptr, 0);
+        if (pod > SidConfig::MAX_POWER_ON_DELAY)
+            pod = SidConfig::MAX_POWER_ON_DELAY;
+        cfg.powerOnDelay = (uint_least16_t)pod;
+    }
+
     if (!engine.config(cfg))
     {
         fprintf(stderr, "ERR config: %s\n", engine.error());

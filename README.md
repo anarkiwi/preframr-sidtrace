@@ -97,6 +97,46 @@ build/sidtrace tune.sid 1 3000 out
 # -> out.sidwr.bin  out.bus.bin  out.meta.txt
 ```
 
+## Determinism
+
+`sidtrace` is **byte-reproducible**: tracing the same tune twice produces
+byte-identical `.sidwr.bin` and `.bus.bin` (verified over 20 runs on Monty and
+Grid_Runner, and gated in CI with `cmp`).
+
+This is not automatic. libsidplayfp's default `SidConfig.powerOnDelay` is the
+sentinel `DEFAULT_POWER_ON_DELAY` (`MAX_POWER_ON_DELAY + 1`), which makes
+`Player::initialise()` pick a **random** power-on delay seeded from
+`std::time(nullptr)`. A different power-on delay means a different number of
+warm-up clocks before the play routine runs, so the boot lag — and the entire
+trace length — drift run-to-run (the `.sidwr.bin` was observed to vary by ~kB
+and occasionally collapse to almost nothing). `sidtrace` pins `powerOnDelay` to
+a fixed value (default `0`), which takes the deterministic branch so every run
+starts from byte-identical C64 state. The C64 RAM power-up pattern
+(`SystemRAMBank::reset`, a fixed VICE-like checkerboard) and the dangling-bus
+LCG (`MMU`, fixed seed) are already deterministic, so this was the sole
+remaining source of variation. Override for experiments with
+`SIDTRACE_POWER_ON_DELAY=<n>` (clamped to `MAX_POWER_ON_DELAY`).
+
+### Known differences vs VICE (`vsiddump`)
+
+These are genuine emulator-convention differences, not config bugs; they are
+documented here so the consuming/recovery layer can account for them:
+
+- **Boot prolog.** VICE emits a leading all-zero init frame (frame 0 is all
+  zeros, music starts at frame 1). libsidplayfp/`sidtrace` emits **no** leading
+  zero frame — its frame 0 is already the first music frame (== VICE's frame 1).
+  `sidtrace` writes a raw cycle-stamped *write log*, not a frame-segmented dump,
+  so it does not (and must not) fabricate a zero frame; the host segmenter /
+  recovery aligns the boot offset. The remaining per-tune boot lag is a small
+  fixed offset (a function of `powerOnDelay`).
+- **~8% shorter tail.** On GoatTracker tunes, libsidplayfp's play routine stops
+  driving the SID at ~92% of VICE's songlength (Grid_Runner: ~14680 frames vs
+  VICE's ~15681) even when `sidtrace` is given a *larger* cycle budget than
+  needed — the writes stop abruptly, they do not taper. This is intrinsic to
+  libsidplayfp's emulation of the tune's song-end and is **independent of
+  `powerOnDelay`** (verified across delays 0–8191: tail stays at ~14680). It is
+  a fundamental libsidplayfp-vs-VICE difference, quantified here, not a knob.
+
 ## How the patched libsidplayfp dependency is carried
 
 libsidplayfp is a **git submodule** (`third_party/libsidplayfp`) pinned to a
