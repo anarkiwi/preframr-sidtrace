@@ -1,0 +1,18 @@
+# build output
+/build/
+
+# Makefile stamps inside the submodule (the submodule tree is patched/built
+# in place; these mark applied-patch / configured state)
+third_party/libsidplayfp/.membus_patch_applied
+third_party/libsidplayfp/.configured
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# stray trace artifacts
+*.sidwr.bin
+*.bus.bin
+*.meta.txt
+*.sid

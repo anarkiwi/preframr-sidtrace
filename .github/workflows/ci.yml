@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake libtool pkg-config xa65
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python test dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      # Cache the configured + built libsidplayfp tree keyed on the pinned
+      # submodule SHA and the patch, so green PRs don't rebuild it each time.
+      - name: Cache libsidplayfp build
+        uses: actions/cache@v4
+        with:
+          path: |
+            third_party/libsidplayfp/src/.libs
+            third_party/libsidplayfp/src/builders/sidlite-builder/.libs
+            third_party/libsidplayfp/.membus_patch_applied
+            third_party/libsidplayfp/.configured
+          key: libsidplayfp-${{ runner.os }}-${{ hashFiles('.gitmodules', 'patches/*.patch', 'Makefile') }}-${{ hashFiles('third_party/libsidplayfp/configure.ac') }}
+
+      - name: Build sidtrace
+        run: make all
+
+      - name: Run tests
+        run: make test
+
+      - name: Sanity-run sidtrace on the generated fixture
+        run: |
+          python3 tests/make_test_sid.py /tmp/fixture.sid
+          ./build/sidtrace /tmp/fixture.sid 1 50 /tmp/out
+          test -s /tmp/out.sidwr.bin
+          test -s /tmp/out.bus.bin
+          cat /tmp/out.meta.txt
