@@ -38,7 +38,7 @@ jobs:
       # Cache the configured + built libsidplayfp tree keyed on the pinned
       # submodule SHA and the patch, so green PRs don't rebuild it each time.
       - name: Cache libsidplayfp build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             third_party/libsidplayfp/src/.libs
