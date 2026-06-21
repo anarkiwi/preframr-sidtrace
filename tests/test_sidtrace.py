@@ -135,6 +135,50 @@ def test_meta_counts_match_files(trace):
     assert int(meta["cycles_per_frame"]) > 0
 
 
+def _trace_to(prefix, fixture_sid, env=None):
+    run_env = dict(os.environ)
+    if env:
+        run_env.update(env)
+    subprocess.run(
+        [_sidtrace_bin(), str(fixture_sid), "1", str(NFRAMES), str(prefix)],
+        check=True,
+        env=run_env,
+    )
+    return Path(f"{prefix}.sidwr.bin"), Path(f"{prefix}.bus.bin")
+
+
+def test_deterministic_byte_identical(tmp_path, fixture_sid):
+    """Tracing the same tune twice must produce byte-identical artifacts.
+
+    libsidplayfp's default powerOnDelay is the random-delay sentinel, seeded
+    from the wall clock; without pinning it the boot lag (and the whole trace
+    length) drifts run-to-run. sidtrace pins powerOnDelay so the C64 start
+    state is fixed; this test guards that the .sidwr.bin and .bus.bin are
+    reproducible, which the dropped dump pipeline relied on.
+    """
+    sw_a, bus_a = _trace_to(tmp_path / "a", fixture_sid)
+    sw_b, bus_b = _trace_to(tmp_path / "b", fixture_sid)
+    assert sw_a.read_bytes() == sw_b.read_bytes(), (
+        ".sidwr.bin differs between identical runs (non-deterministic)"
+    )
+    assert bus_a.read_bytes() == bus_b.read_bytes(), (
+        ".bus.bin differs between identical runs (non-deterministic)"
+    )
+
+
+def test_deterministic_over_many_runs(tmp_path, fixture_sid):
+    """Stronger determinism guard: the sidwr digest is identical across many
+    runs (the original bug surfaced as a *sometimes* short/empty capture, so a
+    single repeat can miss it)."""
+    import hashlib
+
+    digests = set()
+    for i in range(5):
+        sw, _ = _trace_to(tmp_path / f"r{i}", fixture_sid)
+        digests.add(hashlib.sha256(sw.read_bytes()).hexdigest())
+    assert len(digests) == 1, f"non-deterministic sidwr over 5 runs: {digests}"
+
+
 def test_per_frame_write_cadence(trace):
     """The fixture issues a fixed set of writes each frame; check it scales
     with the requested frame count (a coarse correctness signal).
