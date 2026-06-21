@@ -1,0 +1,3 @@
+[submodule "third_party/libsidplayfp"]
+	path = third_party/libsidplayfp
+	url = https://github.com/libsidplayfp/libsidplayfp.git

@@ -1,0 +1,115 @@
+diff --git a/src/c64/c64.cpp b/src/c64/c64.cpp
+index b96881a8..767b0cd2 100644
+--- a/src/c64/c64.cpp
++++ b/src/c64/c64.cpp
+@@ -89,6 +89,12 @@ c64::c64() :
+     cpu(eventScheduler, cpubus)
+ {
+     resetIoBank();
++    MemBusTrace::instance().clockFn =
++        [](void *ctx) -> int64_t {
++            EventScheduler *es = static_cast<EventScheduler *>(ctx);
++            return static_cast<int64_t>(es->getTime(EVENT_CLOCK_PHI1));
++        };
++    MemBusTrace::instance().clockCtx = &eventScheduler;
+ }
+ 
+ void c64::resetIoBank()
+diff --git a/src/c64/c64cpu.h b/src/c64/c64cpu.h
+index 691ab7f8..e82f4a3b 100644
+--- a/src/c64/c64cpu.h
++++ b/src/c64/c64cpu.h
+@@ -26,6 +26,7 @@
+ #endif
+ 
+ #include "c64/mmu.h"
++#include "c64/membus_trace.h"
+ #include "CPU/mos6510.h"
+ 
+ #ifdef VICE_TESTSUITE
+@@ -62,10 +63,16 @@ private:
+     MMU &m_mmu;
+ 
+ protected:
+-    uint8_t cpuRead(uint_least16_t addr) override { return m_mmu.cpuRead(addr); }
++    uint8_t cpuRead(uint_least16_t addr) override
++    {
++        const uint8_t v = m_mmu.cpuRead(addr);
++        MemBusTrace::instance().record(addr, v, 0);
++        return v;
++    }
+ 
+     void cpuWrite(uint_least16_t addr, uint8_t data) override
+     {
++        MemBusTrace::instance().record(addr, data, 1);
+ #ifdef VICE_TESTSUITE
+ #  ifdef PRINTSCREENCODES
+         if (addr >= 0x0400 && addr <= 0x07ff)
+diff --git a/src/c64/membus_trace.h b/src/c64/membus_trace.h
+new file mode 100644
+index 00000000..bc71c03a
+--- /dev/null
++++ b/src/c64/membus_trace.h
+@@ -0,0 +1,62 @@
++/*
++ * membus_trace.h - minimal CPU memory-bus instrumentation for white-box SID
++ * recovery. Not part of upstream libsidplayfp. Scratch use only.
++ *
++ * A process-global recorder. The CPU bus (c64cpubus) reports every read/write;
++ * the c64 object registers a clock getter so each access is cycle-timestamped.
++ * Logging is gated by 'enabled' so normal playback stays fast.
++ */
++#ifndef MEMBUS_TRACE_H
++#define MEMBUS_TRACE_H
++
++#include <cstdint>
++#include <cstdio>
++#include <vector>
++
++namespace libsidplayfp
++{
++
++struct MemAccess
++{
++    int64_t cycle;        // PHI1 cycle at access
++    uint16_t addr;
++    uint8_t  val;
++    uint8_t  rw;          // 0 = read, 1 = write
++};
++
++class MemBusTrace
++{
++public:
++    bool enabled = false;
++
++    // clock getter, installed by the c64 object
++    typedef int64_t (*ClockFn)(void *ctx);
++    ClockFn clockFn = nullptr;
++    void   *clockCtx = nullptr;
++
++    std::vector<MemAccess> accesses;
++
++    static MemBusTrace &instance()
++    {
++        static MemBusTrace inst;
++        return inst;
++    }
++
++    inline int64_t now() const
++    {
++        return clockFn ? clockFn(clockCtx) : 0;
++    }
++
++    inline void record(uint16_t addr, uint8_t val, uint8_t rw)
++    {
++        if (!enabled) return;
++        accesses.push_back(MemAccess{ now(), addr, val, rw });
++    }
++
++    void clear() { accesses.clear(); }
++    void reserve(size_t n) { accesses.reserve(n); }
++};
++
++} // namespace libsidplayfp
++
++#endif // MEMBUS_TRACE_H

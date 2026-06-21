@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # Keep GitHub Actions in the CI workflow current.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Track the pinned libsidplayfp submodule (and its nested driver submodules)
+  # for new upstream commits. The bus-trace patch is verified to apply at build
+  # time, so a bump that breaks the patch surfaces as a red CI on the bot's PR.
+  - package-ecosystem: "gitsubmodule"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Python test dependencies.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
