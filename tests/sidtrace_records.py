@@ -22,6 +22,15 @@ sidtrace emits two files per tune:
   VSA for any indexed read feeding the write, and the min/max/first value. It
   turns "PC wrote register r" into "here is HOW r was computed" and stays flat as
   the capture window grows.
+
+  STSQ (design 3.2) is the inter-frame sample sequence of each SIDDF-flagged state
+  cell (Stage-C recurrence/Berlekamp-Massey input). SDCU (design 2.2/2.3, Stage 3)
+  is the per-state-cell UPDATE DAG: for a fast mid-call SMC accumulator the
+  SID-write slice bottoms out at the shadow cell as a leaf, so SDCU carries the
+  backward slice of the STORE or in-place RMW that recomputed the cell -- the
+  update cell'=f(cell,...) the host generalizes into U. Keyed by cell address;
+  O(state cells), flat vs frames. (Both parse the same SiddfSite shape; for SDCU
+  the `pc` field is the state-cell address.)
 """
 
 import struct
@@ -69,6 +78,8 @@ LEAF_KIND_NAME = {
 }
 
 # ALU ops (mirror membus_trace.h AluOp).
+(ALU_NONE, ALU_ADC, ALU_SBC, ALU_AND, ALU_ORA, ALU_EOR, ALU_ASL, ALU_LSR,
+ ALU_ROL, ALU_ROR, ALU_INC, ALU_DEC, ALU_CMP) = range(13)
 ALU_NAME = {
     0: "NONE", 1: "ADC", 2: "SBC", 3: "AND", 4: "ORA", 5: "EOR",
     6: "ASL", 7: "LSR", 8: "ROL", 9: "ROR", 10: "INC", 11: "DEC", 12: "CMP",
@@ -108,6 +119,7 @@ def parse_sdst(path):
     idx_reads = []
     siddf = []
     stateseq = []
+    sdcu = []
     while off < len(buf):
         tag = buf[off : off + 4]
         off += 4
@@ -152,9 +164,10 @@ def parse_sdst(path):
                 )
                 off += _IDXR_ENTRY.size
                 idx_reads.append((pc, base, stride, imin, imax, count))
-        elif tag == b"SDDF":
+        elif tag in (b"SDDF", b"SDCU"):
             (nent,) = struct.unpack_from("<I", buf, off)
             off += 4
+            dest = siddf if tag == b"SDDF" else sdcu
             for _ in range(nent):
                 (
                     pc, reg, flags, count, vlo, vhi, vfirst,
@@ -176,7 +189,7 @@ def parse_sdst(path):
                 off += 2
                 ops = list(struct.unpack_from(f"<{nops}B", buf, off)) if nops else []
                 off += nops
-                siddf.append(
+                dest.append(
                     {
                         "pc": pc, "reg": reg, "flags": flags, "count": count,
                         "val_lo": vlo, "val_hi": vhi, "val_first": vfirst,
@@ -227,6 +240,7 @@ def parse_sdst(path):
         "idx_reads": idx_reads,
         "siddf": siddf,
         "stateseq": stateseq,
+        "sdcu": sdcu,
     }
 
 

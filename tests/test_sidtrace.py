@@ -33,6 +33,7 @@ from sidtrace_records import (  # noqa: E402
     ACC_EXEC_PLAY,
     ACC_READ_PLAY,
     ACC_WRITE_PLAY,
+    ALU_INC,
     LK_IMMEDIATE,
     LK_STATE_CELL,
     SIDWR_DT,
@@ -300,7 +301,11 @@ def test_stateseq_bounded_and_flat_vs_capture_length(tmp_path, fixture_sid):
         buf = distill_path.read_bytes()
         i = buf.find(b"STSQ")
         assert i >= 0, "no STSQ section"
-        j = buf.find(b"END\x00", i)
+        # STSQ is followed by SDCU then END; measure to whichever comes first so the
+        # STSQ size is isolated from the (separately-bounded) SDCU section.
+        j = buf.find(b"SDCU", i)
+        if j < 0:
+            j = buf.find(b"END\x00", i)
         return (j if j >= 0 else len(buf)) - i
 
     def trace_n(prefix, n):
@@ -323,6 +328,58 @@ def test_stateseq_bounded_and_flat_vs_capture_length(tmp_path, fixture_sid):
     # and the per-cell sample count is capped at M=512.
     d = parse_sdst(b)
     assert all(e["n_samples"] <= 512 for e in d["stateseq"])
+
+
+def test_sdcu_present_for_state_cell_update(trace):
+    """SDCU (design 2.2/2.3) carries the in-call UPDATE DAG of each state cell -- how
+    the cell was recomputed, the data the SID-write slice could not give (the cell is
+    a leaf there). The fixture's RAM counter is INC'd every play-call; its SDCU entry
+    must be the self-feedback accumulator recurrence s' = s+1: an INC op with the cell
+    itself as a (state) leaf. Keyed by the cell ADDRESS, so O(state cells)."""
+    d = parse_sdst(trace["distill"])
+    assert d["sdcu"], "no SDCU update DAGs emitted"
+    # every SDCU cell is a SIDDF-flagged state cell (the emit filter)
+    siddf_state = {
+        a for e in d["siddf"] for k, a, _v in e["leaves"] if k == LK_STATE_CELL
+    }
+    sdcu_addrs = {e["pc"] for e in d["sdcu"]}   # pc field holds the cell addr
+    assert sdcu_addrs <= siddf_state, (
+        f"SDCU cells {sorted(sdcu_addrs)} must be SIDDF state cells "
+        f"{sorted(siddf_state)}"
+    )
+    # the counter cell's update DAG is the s'=s+1 accumulator: INC + self-leaf.
+    counter = next(iter(d["sdcu"]))
+    assert ALU_INC in counter["op_seq"], (
+        f"counter update DAG is not an INC accumulator: ops={counter['op_seq']}"
+    )
+    assert any(a == counter["pc"] for _k, a, _v in counter["leaves"]), (
+        "the accumulator's own cell must be a self-feedback leaf of its update"
+    )
+
+
+def test_sdcu_flat_vs_capture_length(tmp_path, fixture_sid):
+    """SDCU is O(state cells), NOT O(frames): the update DAG of a cell is invariant
+    across frames, so the section size does not grow with the capture window."""
+
+    def sdcu_nbytes(distill_path):
+        buf = distill_path.read_bytes()
+        i = buf.find(b"SDCU")
+        assert i >= 0, "no SDCU section"
+        j = buf.find(b"END\x00", i)
+        return (j if j >= 0 else len(buf)) - i
+
+    def trace_n(prefix, n):
+        subprocess.run(
+            [_sidtrace_bin(), str(fixture_sid), "1", str(n), str(prefix)],
+            check=True,
+        )
+        return Path(f"{prefix}.distill.bin")
+
+    short = trace_n(tmp_path / "s_short", 30)
+    long = trace_n(tmp_path / "s_long", 600)
+    assert sdcu_nbytes(short) == sdcu_nbytes(long), (
+        "SDCU size grew with capture length -- it must be O(state cells), not O(frames)"
+    )
 
 
 def test_per_frame_write_cadence(trace):

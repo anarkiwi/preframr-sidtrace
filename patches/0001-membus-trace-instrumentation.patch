@@ -166,10 +166,10 @@ index 691ab7f8..e82f4a3b 100644
          if (addr >= 0x0400 && addr <= 0x07ff)
 diff --git a/src/c64/membus_trace.h b/src/c64/membus_trace.h
 new file mode 100644
-index 00000000..a1b23fbd
+index 00000000..11ca6128
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,1106 @@
+@@ -0,0 +1,1294 @@
 +/*
 + * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
 + * Not part of upstream libsidplayfp. Scratch use only.
@@ -458,6 +458,20 @@ index 00000000..a1b23fbd
 +    // SIDDF: per-(PC,reg) data-flow summary, same key space as sidWrites.
 +    std::map<uint32_t, SiddfSummary> siddf;
 +
++    // SDCU (per-state-cell UPDATE data-flow summary; design 2.2/2.3). For a fast
++    // mid-call SMC accumulator the SID-write slice bottoms out at the state cell
++    // as a LEAF (the blit just copies the shadow cell to the register); the
++    // generator is the STORE that DEFINED that cell earlier in the SAME play-call
++    // (e.g. A Mind's `LDA $f7,X; STA $12`, or the LFSR `SRE $14`). SDCU is the
++    // backward slice of each state cell's in-call defining store -- the update
++    // DAG `cell' = f(cell, C, K, ...)` the host generalizes into U. Keyed by the
++    // cell ADDRESS (a handful of cells), O(state cells) not O(frames). Reuses the
++    // SiddfSummary shape (op_seq + leaves + strided interval + immediates), but the
++    // `reg` field of the record is unused; the key is the cell address. We also
++    // remember which SID register(s) read this cell so the host can attribute the
++    // recovered update to the axis it drives.
++    std::map<uint16_t, SiddfSummary> sdcu;
++
 +    // STATESEQ: per-candidate-state-cell inter-frame sample sequence (design 3.2).
 +    // Keyed by RAM address. Populated once per play-call (frame) for every address
 +    // that, at sampling time, satisfies the state-cell predicate (WRITE_PLAY &
@@ -631,6 +645,36 @@ index 00000000..a1b23fbd
 +                lastWriteSeq[cur.memAddr]  = ringSeq + 1;   // +1 so 0 means "none"
 +                if (isStore(cur.opcode))
 +                    captureFiller(cur.memAddr, retiredIdx);
++                // SDCU: if this write targets a candidate state cell (RAM read AND
++                // written during play, or EXEC&WRITE = SMC -- the accumulator /
++                // shadow-cell / self-modified-operand class), slice its update DAG
++                // now (its in-call data-flow context is resident in the ring below
++                // it). Two update kinds: a STA from a computed value (sliced to its
++                // value chain), and an in-place RMW (INC/DEC/shift on memory = the
++                // classic counter/accumulator s' = op(s)). O(state cells), flat vs
++                // frames; a cell that is not actually a state leaf is dropped at
++                // emit time (isSiddfStateCell filter).
++                {
++                    const uint16_t ma = cur.memAddr;
++                    const uint8_t b = acc[ma];
++                    const bool wr = b & ACC_WRITE_PLAY;
++                    const bool rd = b & ACC_READ_PLAY;
++                    const bool ex = b & (ACC_EXEC_INIT | ACC_EXEC_PLAY);
++                    const bool isStateWrite = wr && (rd || ex) &&
++                        !(ma >= 0xD400 && ma <= 0xD7FF);
++                    if (isStateWrite)
++                    {
++                        if (isStore(cur.opcode))
++                            sliceCellUpdate(retiredIdx, ma);
++                        else
++                        {
++                            const uint8_t op = aluOp(cur.opcode);
++                            if (op == ALU_INC || op == ALU_DEC || op == ALU_ASL ||
++                                op == ALU_LSR || op == ALU_ROL || op == ALU_ROR)
++                                recordCellRmw(ma, op, cur.pc);
++                        }
++                    }
++                }
 +            }
 +            ringHead = (ringHead + 1) % RING_CAP;
 +            if (ringFill < RING_CAP) ringFill++;
@@ -665,6 +709,7 @@ index 00000000..a1b23fbd
 +        idxReads.clear();
 +        sidStream.clear();
 +        siddf.clear();
++        sdcu.clear();
 +        stateSeq.clear();
 +        lastSidWriteCycle = -1;
 +        anyFrameStarted = false;
@@ -1074,6 +1119,145 @@ index 00000000..a1b23fbd
 +    // as it stood JUST BEFORE ring slot `anchor` (i.e. scan strictly earlier).
 +    struct SliceTask { uint32_t anchor; uint8_t reg; uint16_t mem; bool isReg; };
 +
++    // ----- SDCU: slice a state cell's in-call UPDATE store (design 2.2/2.3) ----
++    // `storeSlot` is the ring slot of a just-retired STA/STX/STY to `cellAddr` (a
++    // candidate state cell). Build the backward dynamic slice of the STORED VALUE
++    // within this play-call -- the update DAG `cell' = f(cell, C, K, immediates)`
++    // -- and accumulate it into sdcu[cellAddr] (same SiddfSummary shape as a SID
++    // write slice: op_seq + leaves + strided interval + immediates). Bounded; the
++    // shape is invariant across frames so the full walk runs only for the first
++    // few occurrences. This captures EXACTLY what the SID-write slice could not:
++    // how the SMC operand cell is recomputed each call.
++    // Record an in-place RMW update of a state cell (INC/DEC/shift on memory) as a
++    // self-feedback recurrence: cell' = op(cell). The cell is its own leaf (the
++    // prior value carries between calls), and the op is the recurrence kind. This
++    // is the canonical counter/accumulator (s' = s +/- 1) and the LFSR shift cell.
++    inline void recordCellRmw(uint16_t cellAddr, uint8_t op, uint16_t pc)
++    {
++        SiddfSummary &s = sdcu[cellAddr];
++        s.count++;
++        addPc(s, pc);
++        if (s.count > 1) return;             // op + leaf are invariant; record once
++        if (op != ALU_NONE && s.opSeq.size() < 32) s.opSeq.push_back(op);
++        addLeaf(s, LK_RAM_READ, cellAddr, ramFn ? ramFn(ramCtx, cellAddr) : 0);
++    }
++
++    inline void sliceCellUpdate(uint32_t storeSlot, uint16_t cellAddr)
++    {
++        const RetiredInstr st = ring[storeSlot];
++        SiddfSummary &s = sdcu[cellAddr];
++        const uint8_t v = st.memVal;
++        if (!s.valSeen) { s.valFirst = v; s.valSeen = true; }
++        if (v < s.valLo) s.valLo = v;
++        if (v > s.valHi) s.valHi = v;
++        s.count++;
++        addPc(s, st.pc);
++        if (s.count > 32) return;             // shape invariant; refine cheaply only
++        const bool firstWalk = (s.count <= 4);
++
++        const uint32_t windowLen = ringFill < RING_CAP ? ringFill : RING_CAP;
++        const uint64_t oldestSeq = (ringSeq > windowLen) ? (ringSeq - windowLen) : 0;
++
++        SliceTask wl[128];
++        uint32_t wlHead = 0, wlTail = 0;
++        auto push = [&](SliceTask t) { if (wlTail < 128) wl[wlTail++] = t; };
++        push(SliceTask{ storeSlot, storeSrcReg(st.opcode), 0, true });
++
++        uint32_t resolved = 0;
++        while (wlHead < wlTail && resolved < 256)
++        {
++            SliceTask t = wl[wlHead++];
++            ++resolved;
++            if (!t.isReg)
++            {
++                const uint16_t a = t.mem;
++                // Do not chase the cell's own prior value (self-referential
++                // accumulator) -- record it as a state leaf and stop. This is the
++                // recurrence s' = f(s, ...): s itself is a leaf of f.
++                if (a == cellAddr)
++                {
++                    addLeaf(s, LK_RAM_READ, a, ramFn ? ramFn(ramCtx, a) : 0);
++                    continue;
++                }
++                const uint64_t wseq = lastWriteSeq[a];
++                if (wseq != 0 && (wseq - 1) >= oldestSeq && (wseq - 1) < ringSeq)
++                {
++                    const uint32_t wslot = lastWriteSlot[a];
++                    if (ring[wslot].ringSeq == (wseq - 1) && ring[wslot].memWrite &&
++                        ring[wslot].memAddr == a)
++                    {
++                        RetiredInstr &w = ring[wslot];
++                        addPc(s, w.pc);
++                        if (isStore(w.opcode))
++                        {
++                            push(SliceTask{ wslot, storeSrcReg(w.opcode), 0, true });
++                            if (w.idxUsed != SR_NONE)
++                                push(SliceTask{ wslot, w.idxUsed, 0, true });
++                        }
++                        else
++                        {
++                            const uint8_t op = aluOp(w.opcode);
++                            if (firstWalk && op != ALU_NONE && s.opSeq.size() < 32)
++                                s.opSeq.push_back(op);
++                            addLeaf(s, LK_RAM_READ, a, ramFn ? ramFn(ramCtx, a) : 0);
++                        }
++                        continue;
++                    }
++                }
++                addLeaf(s, LK_RAM_READ, a, ramFn ? ramFn(ramCtx, a) : 0);
++                continue;
++            }
++            bool found = false;
++            uint32_t idx = t.anchor;
++            for (uint32_t steps = 0; steps < windowLen; ++steps)
++            {
++                idx = (idx == 0) ? (RING_CAP - 1) : (idx - 1);
++                RetiredInstr &in = ring[idx];
++                const uint8_t dr = defReg(in.opcode);
++                const bool defs = (dr == t.reg) ||
++                                  (t.reg == SR_X && alsoDefsX(in.opcode));
++                if (!defs) continue;
++                found = true;
++                addPc(s, in.pc);
++                const uint8_t a = aluOp(in.opcode);
++                if (firstWalk && dr == SR_A && a != ALU_NONE && s.opSeq.size() < 32)
++                    s.opSeq.push_back(a);
++                if (readsMem(in.opcode) && (in.memRead || in.memWrite))
++                {
++                    if (in.idxUsed != SR_NONE)
++                    {
++                        if (!s.hasStride) { s.hasStride = true; s.strideBase = in.idxBase; }
++                        const uint8_t iv = in.idxVal;
++                        if (iv < s.strideIdxMin) s.strideIdxMin = iv;
++                        if (iv > s.strideIdxMax) s.strideIdxMax = iv;
++                        push(SliceTask{ idx, in.idxUsed, 0, true });
++                    }
++                    push(SliceTask{ idx, 0, in.memAddr, false });
++                }
++                else
++                {
++                    switch (in.opcode)
++                    {
++                    case 0x8A: push(SliceTask{ idx, SR_X, 0, true }); break;
++                    case 0x98: push(SliceTask{ idx, SR_Y, 0, true }); break;
++                    case 0xAA: case 0xA8: push(SliceTask{ idx, SR_A, 0, true }); break;
++                    default: break;
++                    }
++                    if (firstWalk && in.hasImm &&
++                        (in.opcode == 0xA9 || in.opcode == 0xA2 || in.opcode == 0xA0 ||
++                         a == ALU_ADC || a == ALU_SBC || a == ALU_AND ||
++                         a == ALU_ORA || a == ALU_EOR || a == ALU_CMP ||
++                         in.opcode == 0xAB || in.opcode == 0x4B ||
++                         in.opcode == 0x0B || in.opcode == 0x2B ||
++                         in.opcode == 0x6B || in.opcode == 0xCB))
++                        addLeaf(s, LK_IMMEDIATE, 0, in.imm);
++                }
++                break;
++            }
++            if (!found) addLeaf(s, LK_OUT_OF_WINDOW, 0, 0);
++        }
++    }
++
 +    // ----- the bounded backward dynamic slicer ------------------------------
 +    // ringIdx is the ring slot of the just-retired STA/STX/STY $D4xx. Build the
 +    // backward dynamic slice of the stored value over the ring buffer. Each task
@@ -1253,6 +1437,10 @@ index 00000000..a1b23fbd
 +    void finalizeLeaves()
 +    {
 +        for (auto &kv : siddf)
++            for (auto &l : kv.second.leaves)
++                if (l.kind == LK_RAM_READ)
++                    l.kind = classifyLeaf(l.addr);
++        for (auto &kv : sdcu)
 +            for (auto &l : kv.second.leaves)
 +                if (l.kind == LK_RAM_READ)
 +                    l.kind = classifyLeaf(l.addr);
