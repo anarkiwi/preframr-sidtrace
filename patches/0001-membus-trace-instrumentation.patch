@@ -169,7 +169,7 @@ new file mode 100644
 index 00000000..11ca6128
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,1310 @@
+@@ -0,0 +1,1357 @@
 +/*
 + * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
 + * Not part of upstream libsidplayfp. Scratch use only.
@@ -380,6 +380,13 @@ index 00000000..11ca6128
 +    bool     gotOpcode = false;
 +    uint8_t  imm = 0;         // first operand byte (the immediate, for #imm modes)
 +    bool     hasImm = false;
++    uint16_t immAddr = 0;     // RAM address of the first operand byte (= pc+1 for
++                              // 2-byte #imm modes). When that byte is itself written
++                              // during play (EXEC&WRITE = SMC) the immediate is NOT a
++                              // constant -- it is a self-modified-operand STATE cell
++                              // (design 1.3 SMC / 2.3), the DefMon compiled-player
++                              // class: `LDX #lo / STX $D4xx` with the `#lo` operand
++                              // poked each call. The slicer must follow it as state.
 +    uint16_t fetchLo = 0;     // first instruction-fetch address (= opcode addr)
 +    uint32_t fetchCount = 0;  // number of code-fetch bytes consumed this instr
 +    uint16_t memAddr = 0;     // effective data address (read or write), if any
@@ -587,6 +594,7 @@ index 00000000..11ca6128
 +            if (!cur.hasImm)                // first operand byte
 +            {
 +                cur.imm = val;
++                cur.immAddr = addr;         // RAM address of the operand byte (SMC check)
 +                cur.hasImm = true;
 +            }
 +            return;
@@ -993,6 +1001,24 @@ index 00000000..11ca6128
 +        return LK_RAM_READ;
 +    }
 +
++    // Is `addr` a candidate self-modified-operand byte: fetched as code AND written
++    // at some point (design 1.3 SMC / 2.3)? Such a byte is mutable STATE, not a
++    // constant -- the DefMon compiled-player class (`LDX #lo / STX $D4xx`, the `#lo`
++    // operand poked each call) generates EVERY axis this way, so the immediate the
++    // slicer bottoms out at is really a state cell at the operand address. We accept
++    // EXEC & (WRITE_PLAY | WRITE_INIT) as a CANDIDATE here because the slice's first
++    // walk runs on the first play-call, BEFORE the per-frame writer has set
++    // WRITE_PLAY -- so requiring WRITE_PLAY at walk time misses it. The leaf is
++    // recorded provisionally and finalizeLeaves() makes the SMC-correct call against
++    // the FINAL access-type map (a byte written only during INIT stays a non-state
++    // RAM/immediate constant; a per-call-poked operand becomes LK_STATE_CELL).
++    inline bool isSmcOperandCandidate(uint16_t addr) const
++    {
++        const uint8_t b = acc[addr];
++        return (b & (ACC_EXEC_INIT | ACC_EXEC_PLAY)) &&
++               (b & (ACC_WRITE_PLAY | ACC_WRITE_INIT));
++    }
++
 +    // Sample the SIDDF-flagged state cells at a play-call boundary (design 3.2).
 +    // We target EXACTLY the cells the live SIDDF slices have already surfaced as
 +    // state leaves -- not every write/read RAM cell (a busy player touches
@@ -1266,12 +1292,33 @@ index 00000000..11ca6128
 +                         in.opcode == 0xAB || in.opcode == 0x4B ||
 +                         in.opcode == 0x0B || in.opcode == 0x2B ||
 +                         in.opcode == 0x6B || in.opcode == 0xCB))
-+                        addLeaf(s, LK_IMMEDIATE, 0, in.imm);
++                        addImmOrSmcLeaf(s, in);
 +                }
 +                break;
 +            }
 +            if (!found) addLeaf(s, LK_OUT_OF_WINDOW, 0, 0);
 +        }
++    }
++
++    // Record an immediate-operand leaf, but if the operand byte is a self-modified
++    // operand (EXEC&WRITE during play -- the DefMon compiled-player class), record
++    // it as a STATE_CELL leaf at the operand ADDRESS instead of a constant: the
++    // value the axis writes is that poked byte, so its inter-frame sequence (the
++    // operand's own write stream) IS the generator. Its update slice is seeded at
++    // write time (isStateWrite in beginInstr) and its STATESEQ is gathered because
++    // isSiddfStateCell now sees this leaf. (design 1.3 SMC / 2.3 / 2.5)
++    inline void addImmOrSmcLeaf(SiddfSummary &s, const RetiredInstr &in)
++    {
++        // Provisionally record a candidate SMC operand as a RAM_READ leaf at the
++        // operand ADDRESS; finalizeLeaves() upgrades it to LK_STATE_CELL iff the
++        // final access-type map says it is EXEC&WRITE_PLAY (and otherwise leaves it
++        // as a RAM constant). A genuine constant immediate (operand never written)
++        // is recorded as LK_IMMEDIATE as before.
++        if (in.hasImm && in.immAddr && isSmcOperandCandidate(in.immAddr))
++            addLeaf(s, LK_RAM_READ, in.immAddr,
++                    ramFn ? ramFn(ramCtx, in.immAddr) : in.imm);
++        else
++            addLeaf(s, LK_IMMEDIATE, 0, in.imm);
 +    }
 +
 +    // ----- the bounded backward dynamic slicer ------------------------------
@@ -1436,7 +1483,7 @@ index 00000000..11ca6128
 +                        (in.opcode == 0xA9 || in.opcode == 0xA2 || in.opcode == 0xA0 ||
 +                         a2 == ALU_ADC || a2 == ALU_SBC || a2 == ALU_AND ||
 +                         a2 == ALU_ORA || a2 == ALU_EOR || a2 == ALU_CMP))
-+                        addLeaf(s, LK_IMMEDIATE, 0, in.imm);
++                        addImmOrSmcLeaf(s, in);
 +                }
 +                break;
 +            }

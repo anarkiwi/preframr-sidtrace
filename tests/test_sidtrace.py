@@ -448,3 +448,99 @@ def test_per_frame_write_cadence(trace):
     assert np.all(np.diff(d400["val"].astype(np.int16)) >= 0) or (
         np.sum(np.diff(d400["val"].astype(np.int16)) < 0) <= 1
     )
+
+
+# --------------------------------------------------------------------------- #
+# Stage 5 -- the SELF-MODIFYING-OPERAND axis class (the DefMon compiled-player
+# shape). DefMon generates every axis as `LDX #lo / STX $D4xx` whose `#lo` operand
+# byte is poked each play-call. Before the Stage-5 fix the SID-write slice bottomed
+# out at that immediate as a CONSTANT, so DefMon emitted ZERO SDCU and ZERO STATESEQ
+# (the host got none of the structure it gets for JCH). The fix classifies a
+# self-modified immediate operand as a state cell at the operand address (deferred
+# to finalizeLeaves so the per-call WRITE_PLAY is seen), re-enabling SDCU + STATESEQ.
+# --------------------------------------------------------------------------- #
+@pytest.fixture(scope="session")
+def smc_sid(tmp_path_factory):
+    d = tmp_path_factory.mktemp("smc_sid")
+    sid = d / "smc.sid"
+    subprocess.run(
+        [sys.executable, str(HERE / "make_smc_operand_sid.py"), str(sid)],
+        check=True,
+    )
+    assert sid.stat().st_size > 0
+    return sid
+
+
+@pytest.fixture(scope="session")
+def smc_trace(tmp_path_factory, smc_sid):
+    d = tmp_path_factory.mktemp("smc_trace")
+    prefix = d / "out"
+    subprocess.run(
+        [_sidtrace_bin(), str(smc_sid), "1", "200", str(prefix)], check=True
+    )
+    return {"distill": Path(f"{prefix}.distill.bin")}
+
+
+def test_smc_operand_surfaced_as_state_cell(smc_trace):
+    """The self-modified `LDX #` operand byte ($D400's source) must be a STATE_CELL
+    leaf of the SID-write slice -- at the operand ADDRESS -- not an immediate
+    constant. This is the Gap-2 root cause: a constant leaf yields no state cell, so
+    SDCU/STATESEQ never trigger (design 1.3 SMC / 2.3)."""
+    d = parse_sdst(smc_trace["distill"])
+    state_addrs = {
+        a for e in d["siddf"] for k, a, _v in e["leaves"] if k == LK_STATE_CELL
+    }
+    assert state_addrs, "SMC operand byte not surfaced as a state cell"
+    # the operand byte is EXEC & WRITE during play (the SMC-correct classification).
+    for a in state_addrs:
+        bits = int(d["acc"][a])
+        assert bits & ACC_EXEC_PLAY, f"${a:04x} state cell is not EXEC during play"
+        assert bits & ACC_WRITE_PLAY, f"${a:04x} state cell not WRITE during play"
+
+
+def test_smc_operand_emits_sdcu_and_stateseq(smc_trace):
+    """The Gap-2 fix: once the operand is a state cell, its UPDATE slice (SDCU) and
+    inter-frame sample sequence (STATESEQ) emit -- the structure the host needs to
+    fit a recurrence. Both were ZERO before the fix."""
+    d = parse_sdst(smc_trace["distill"])
+    assert d["sdcu"], "SMC operand produced no SDCU update DAG (Gap-2 regression)"
+    assert d["stateseq"], "SMC operand produced no STATESEQ (Gap-2 regression)"
+    # SDCU/STATESEQ cells are exactly the SIDDF-flagged state cells.
+    state_addrs = {
+        a for e in d["siddf"] for k, a, _v in e["leaves"] if k == LK_STATE_CELL
+    }
+    assert {e["pc"] for e in d["sdcu"]} <= state_addrs
+    assert {e["addr"] for e in d["stateseq"]} <= state_addrs
+    # the operand cell's STATESEQ tracks the generator (here a +1 counter walk).
+    samples = d["stateseq"][0]["samples"]
+    assert len(samples) >= 2 and len(set(samples)) >= 2, (
+        "STATESEQ did not capture the operand's inter-frame variation"
+    )
+
+
+def test_smc_operand_artifact_bounded_and_flat(tmp_path, smc_sid):
+    """The Gap-2 fix stays bounded/flat vs capture length: the SMC-operand cells'
+    SDCU structural part is invariant and STATESEQ saturates at the cap, so the
+    artifact does not grow proportionally with frames (design 3 boundedness)."""
+    def cells(prefix, n):
+        subprocess.run(
+            [_sidtrace_bin(), str(smc_sid), "1", str(n), str(prefix)], check=True
+        )
+        d = parse_sdst(Path(f"{prefix}.distill.bin"))
+        sdcu = {
+            e["pc"]: (tuple(e["op_seq"]), tuple(e["leaves"]))
+            for e in d["sdcu"]
+        }
+        nstseq = {e["addr"]: e["n_samples"] for e in d["stateseq"]}
+        return sdcu, nstseq
+
+    a_sdcu, a_st = cells(tmp_path / "a", 600)
+    b_sdcu, b_st = cells(tmp_path / "b", 1200)
+    common = set(a_sdcu) & set(b_sdcu)
+    assert common, "no common SMC SDCU cells across capture lengths"
+    for addr in common:
+        assert a_sdcu[addr] == b_sdcu[addr], (
+            f"SMC operand ${addr:04x} update DAG changed with capture length"
+        )
+    for addr in set(a_st) & set(b_st):
+        assert a_st[addr] <= 512 and b_st[addr] <= 512, "STATESEQ exceeds the cap"
