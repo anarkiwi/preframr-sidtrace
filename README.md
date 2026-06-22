@@ -2,30 +2,35 @@
 
 `sidtrace` is a white-box SID recovery recorder built on a lightly-patched
 [libsidplayfp](https://github.com/libsidplayfp/libsidplayfp). Given a `.sid`
-file it runs the tune through the cycle-accurate libsidplayfp 6510/SID
-emulation and emits two cycle-stamped binary artifacts:
+file it runs the tune through the cycle-accurate libsidplayfp 6510/SID emulation,
+**distills the execution in the emulator**, and emits two small binary artifacts:
 
-1. **`<prefix>.sidwr.bin`** — every SID register write. This is the
-   headlessvice-compatible **dump source** (it replaces VICE `vsiddump` for
-   per-frame register dumps).
-2. **`<prefix>.bus.bin`** — the full CPU **bus trace**: every 6510 read and
-   write, cycle-stamped. This is the **provenance substrate** for the generic
-   BACC program recovery.
+1. **`<prefix>.sidwr.bin`** — the timestamped SID register-write stream (one
+   ~25-write burst per frame). This is the per-frame register **dump source** (it
+   replaces VICE `vsiddump`) and the render/residual-zero gate.
+2. **`<prefix>.distill.bin`** — the compact **SDST** artifact: the in-emulator
+   distillation of the whole run (a few KB). This is the provenance substrate for
+   the generic / identity BACC program recovery.
 
-This repo is **Phase 1** of the headlessvice-replacement plan: build the tool
-and emit both artifacts, with CI + tests. The offline provenance-graph analysis
-and generic BACC recovery are Phase 2 (out of scope here). The authoritative
-design is `design/infra/libsidplay_callgraph_recovery_design.md` in the
-`preframr-xpt` repo.
+**Why distill, not dump.** The cycle-by-cycle CPU bus trace was GBs/tune —
+unusable at the 60,000-tune scale (petabytes of I/O). sidtrace now does the
+analysis in C++ during emulation (`src/c64/membus_trace.h`) into bounded
+fixed-size accumulators (a handful of 64 KiB arrays + small maps; peak memory does
+not grow with run length) and emits one few-KB SDST artifact. The retired raw bus
+trace is gone.
 
-## Output record layout
+**SMC-correct classification.** Memory is classified by ACCESS TYPE accumulated
+per address: instruction-fetch (EXEC), data-read (READ), data-write (WRITE), per
+init/play phase. Self-modifying code is `EXEC_PLAY & WRITE_PLAY` (executed AND
+written during play); song data is `READ_PLAY & ¬WRITE_PLAY & ¬EXEC` inside the
+loaded image. SMC operands are code modification, excluded from song data by the
+`EXEC` term — not by a fragile write-set subtraction.
 
-Both files are **packed little-endian** records (no struct padding — each field
-is written individually by the recorder). 12 bytes per record in both files.
+## Output layout
 
 ### `<prefix>.sidwr.bin` — SID register writes
 
-Every write to `$D400-$D7FF` (any SID chip), `rw == write`.
+Packed little-endian, 12 bytes/record. Every write to `$D400-$D7FF`.
 
 | field   | type   | bytes | meaning                              |
 |---------|--------|-------|--------------------------------------|
@@ -34,31 +39,28 @@ Every write to `$D400-$D7FF` (any SID chip), `rw == write`.
 | `reg`   | uint8  | 1     | SID register = `addr & 0x1F`         |
 | `val`   | uint8  | 1     | byte written                         |
 
-### `<prefix>.bus.bin` — full CPU bus trace
+### `<prefix>.distill.bin` — the SDST distilled artifact
 
-Every CPU data-bus access (read and write).
+Versioned little-endian. Header (`magic "SDST"`, version, init/play/load addrs,
+subtune, nframes, cycles_per_frame, t0_cycle, loaded-image length) then tagged
+sections terminated by `"END\0"`:
 
-| field   | type   | bytes | meaning                              |
-|---------|--------|-------|--------------------------------------|
-| `cycle` | int64  | 8     | absolute PHI1 CPU cycle of the access|
-| `addr`  | uint16 | 2     | bus address                          |
-| `val`   | uint8  | 1     | byte on the bus                      |
-| `rw`    | uint8  | 1     | `0` = read, `1` = write              |
+| section | contents |
+|---------|----------|
+| `ACMP`  | RLE per-address ACCESS-TYPE map: `(run u16, bits u8)` over `0..65535`; `bits` = OR of EXEC/READ/WRITE × INIT/PLAY |
+| `SNAP`  | post-init RAM snapshot for the SONG-DATA region only: `(addr u16, len u16, bytes[len])` runs — the verbatim song bytes, captured once at the init→play boundary |
+| `SIDW`  | PC-tagged SID-write summary: `(pc u16, reg u8, _pad u8, count u32, lastVal u8, _pad[3])` — voice-lane attribution by code site |
+| `IDXR`  | indexed-read VSA summary: `(pc u16, base u16, stride i32, idxMin u8, idxMax u8, _pad u16, count u32)` — table base / element size / length / traversal |
 
-The SID-write log is exactly the subset of the bus trace with `rw == 1` and
-`$D400 <= addr <= $D7FF`. Frames are delineated by the host from the SID-write
-cycle clusters (the same way the corpus register dump uses the IRQ cycle as the
-frame id).
-
-`SIDTRACE_NOBUS=1` skips the (large) `.bus.bin` for a cheap sidwr-only pass.
+The full byte layout is documented in `src/sidtrace.cpp` (`emit_distill`).
 
 ### `<prefix>.meta.txt`
 
-Plain-text tune metadata: format, subtune, song count, init/play/load
-addresses, speed, `cycles_per_frame`, `total_cycles`, `n_sid_writes`,
-`n_bus_accesses`, and whether a real KERNAL was supplied.
+Plain-text tune metadata: format, subtune, song count, init/play/load addresses,
+speed, `artifact=SDST`, `cycles_per_frame`, `total_cycles`, `n_sid_writes`,
+`distill_bytes`, and whether a real KERNAL was supplied.
 
-Numpy dtypes for reading the artifacts live in
+Readers (numpy dtype for `.sidwr.bin`, `parse_sdst` for the artifact) live in
 [`tests/sidtrace_records.py`](tests/sidtrace_records.py).
 
 ## Build
@@ -94,13 +96,13 @@ tunes (like the bundled test fixture) need none. Example:
 
 ```sh
 build/sidtrace tune.sid 1 3000 out
-# -> out.sidwr.bin  out.bus.bin  out.meta.txt
+# -> out.sidwr.bin  out.distill.bin  out.meta.txt
 ```
 
 ## Determinism
 
 `sidtrace` is **byte-reproducible**: tracing the same tune twice produces
-byte-identical `.sidwr.bin` and `.bus.bin` (verified over 20 runs on Monty and
+byte-identical `.sidwr.bin` and `.distill.bin` (verified over many runs on Monty and
 Grid_Runner, and gated in CI with `cmp`).
 
 This is not automatic. libsidplayfp's default `SidConfig.powerOnDelay` is the
@@ -166,7 +168,7 @@ The suite (`tests/test_sidtrace.py`) generates a tiny, fully self-contained PSID
 fixture from scratch (`tests/make_test_sid.py` — no HVSC, no network, no
 licensing concern), runs `sidtrace` on it, and asserts:
 
-- both `.sidwr.bin` / `.bus.bin` exist with whole (12-byte) records;
+- both `.sidwr.bin` (whole 12-byte records) and the SDST `.distill.bin` exist and parse;
 - cycles are monotonically non-decreasing in both files;
 - every SID write lands in `$D400-$D418` with `reg == addr & 0x1F`, `reg <= 24`;
 - the SID-write log is exactly the `$D4xx`, `rw=1` subset of the bus trace
