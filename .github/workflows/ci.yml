@@ -58,5 +58,7 @@ jobs:
           python3 tests/make_test_sid.py /tmp/fixture.sid
           ./build/sidtrace /tmp/fixture.sid 1 50 /tmp/out
           test -s /tmp/out.sidwr.bin
-          test -s /tmp/out.bus.bin
+          test -s /tmp/out.distill.bin
+          # the distilled artifact is a few KB -- not a multi-GB bus trace
+          test "$(stat -c%s /tmp/out.distill.bin)" -lt 65536
           cat /tmp/out.meta.txt

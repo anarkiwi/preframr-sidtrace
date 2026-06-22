@@ -9,6 +9,7 @@ valid SID register writes in $D400-$D418.
 
 PSID v2 layout (big-endian header) per the PSID/SID file format spec.
 """
+
 import struct
 import sys
 
@@ -38,24 +39,46 @@ COUNTER_ADDR = 0x1040  # RAM frame-counter cell, past the code
 #   $1040: 00   frame counter byte (COUNTER_ADDR)
 _CLO = COUNTER_ADDR & 0xFF
 _CHI = (COUNTER_ADDR >> 8) & 0xFF
-CODE = bytes([
-    # init @ $1000
-    0xA9, 0x00,             # LDA #$00
-    0x8D, 0x18, 0xD4,       # STA $D418
-    0x60,                   # RTS
-    0x00, 0x00, 0x00,       # padding to reach $1009 (PLAY_ADDR)
-    # play @ $1009
-    0xAD, _CLO, _CHI,       # LDA COUNTER_ADDR
-    0x8D, 0x00, 0xD4,       # STA $D400   (voice1 freq lo)
-    0xA9, 0x11,             # LDA #$11
-    0x8D, 0x01, 0xD4,       # STA $D401   (voice1 freq hi)
-    0xA9, 0x21,             # LDA #$21
-    0x8D, 0x04, 0xD4,       # STA $D404   (voice1 control: gate + sawtooth)
-    0xA9, 0x0F,             # LDA #$0F
-    0x8D, 0x18, 0xD4,       # STA $D418   (master volume = 15)
-    0xEE, _CLO, _CHI,       # INC COUNTER_ADDR (RAM state advances each frame)
-    0x60,                   # RTS
-])
+CODE = bytes(
+    [
+        # init @ $1000
+        0xA9,
+        0x00,  # LDA #$00
+        0x8D,
+        0x18,
+        0xD4,  # STA $D418
+        0x60,  # RTS
+        0x00,
+        0x00,
+        0x00,  # padding to reach $1009 (PLAY_ADDR)
+        # play @ $1009
+        0xAD,
+        _CLO,
+        _CHI,  # LDA COUNTER_ADDR
+        0x8D,
+        0x00,
+        0xD4,  # STA $D400   (voice1 freq lo)
+        0xA9,
+        0x11,  # LDA #$11
+        0x8D,
+        0x01,
+        0xD4,  # STA $D401   (voice1 freq hi)
+        0xA9,
+        0x21,  # LDA #$21
+        0x8D,
+        0x04,
+        0xD4,  # STA $D404   (voice1 control: gate + sawtooth)
+        0xA9,
+        0x0F,  # LDA #$0F
+        0x8D,
+        0x18,
+        0xD4,  # STA $D418   (master volume = 15)
+        0xEE,
+        _CLO,
+        _CHI,  # INC COUNTER_ADDR (RAM state advances each frame)
+        0x60,  # RTS
+    ]
+)
 assert PLAY_ADDR - LOAD_ADDR == 9, "play routine must start at $1009"
 # pad out to the frame-counter data cell at COUNTER_ADDR
 pad = (COUNTER_ADDR - LOAD_ADDR) - len(CODE)
@@ -89,11 +112,19 @@ def build_psid() -> bytes:
     # >L       = speed
     header = magic + struct.pack(
         ">HHHHHHHL",
-        version, data_offset, load_addr, init_addr, play_addr,
-        songs, start_song, speed,
+        version,
+        data_offset,
+        load_addr,
+        init_addr,
+        play_addr,
+        songs,
+        start_song,
+        speed,
     )
     header += name + author + released
-    header += struct.pack(">HBBBB", flags, start_page, page_length, second_sid, third_sid)
+    header += struct.pack(
+        ">HBBBB", flags, start_page, page_length, second_sid, third_sid
+    )
     assert len(header) == data_offset, f"header len {len(header)} != {data_offset}"
     return header + c64_data
 

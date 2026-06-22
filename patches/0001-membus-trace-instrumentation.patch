@@ -1,8 +1,90 @@
+diff --git a/src/c64/CPU/mos6510.cpp b/src/c64/CPU/mos6510.cpp
+index 10bec1a1..d1c9b0d9 100644
+--- a/src/c64/CPU/mos6510.cpp
++++ b/src/c64/CPU/mos6510.cpp
+@@ -26,6 +26,7 @@
+ #include "sidendian.h"
+ 
+ #include "opcodes.h"
++#include "c64/membus_trace.h"
+ 
+ #include <cstdio>
+ #include "mos6510debug.h"
+@@ -266,6 +267,13 @@ void MOS6510::fetchNextOpcode()
+ 
+     rdyOnThrowAwayRead = false;
+ 
++    // membus-trace: record the instruction's start PC unconditionally so the bus
++    // trace can attribute every access to its code site, and mark this address as
++    // an instruction FETCH (the EXEC access type) so the distiller classifies
++    // code vs. data vs. self-modifying code by access type (SMC = EXEC & WRITE).
++    m_membusInstrStartPC = Register_ProgramCounter;
++    MemBusTrace::instance().recordFetch(Register_ProgramCounter);
++
+     cycleCount = cpuRead(Register_ProgramCounter) << 3;
+     Register_ProgramCounter++;
+ 
+@@ -335,6 +343,9 @@ void MOS6510::throwAwayRead()
+  */
+ void MOS6510::FetchDataByte()
+ {
++    // membus-trace: operand bytes are part of the instruction stream -- mark
++    // EXEC so a self-modified operand (written during play) is classified SMC.
++    MemBusTrace::instance().recordFetch(Register_ProgramCounter);
+     Cycle_Data = cpuRead(Register_ProgramCounter);
+     if (!d1x1)
+     {
+@@ -360,6 +371,7 @@ void MOS6510::FetchDataByte()
+  */
+ void MOS6510::FetchLowAddr()
+ {
++    MemBusTrace::instance().recordFetch(Register_ProgramCounter);  // operand = EXEC
+     Cycle_EffectiveAddress = cpuRead(Register_ProgramCounter);
+     Register_ProgramCounter++;
+ 
+@@ -402,6 +414,7 @@ void MOS6510::FetchLowAddrY()
+  */
+ void MOS6510::FetchHighAddr()
+ {   // Get the high byte of an address from memory
++    MemBusTrace::instance().recordFetch(Register_ProgramCounter);  // operand = EXEC
+     endian_16hi8(Cycle_EffectiveAddress, cpuRead(Register_ProgramCounter));
+     Register_ProgramCounter++;
+ 
+diff --git a/src/c64/CPU/mos6510.h b/src/c64/CPU/mos6510.h
+index 91fb40e6..0a6c9a6d 100644
+--- a/src/c64/CPU/mos6510.h
++++ b/src/c64/CPU/mos6510.h
+@@ -159,6 +159,11 @@ private:
+     uint_least16_t Cycle_EffectiveAddress;
+     uint_least16_t Cycle_Pointer;
+ 
++    // membus-trace: the start PC of the instruction currently executing, tracked
++    // unconditionally (independent of the debug build) so the bus trace can
++    // attribute each access to its issuing code site. Not upstream.
++    uint_least16_t m_membusInstrStartPC = 0;
++
+     uint8_t Cycle_Data;
+     uint8_t Register_StackPointer;
+     uint8_t Register_Accumulator;
+@@ -324,6 +329,13 @@ public:
+ 
+     inline uint8_t cpuRead(uint_least16_t addr) { return dataBus.cpuRead(addr); }
+ 
++    // membus-trace: issuing instruction's start PC (see m_membusInstrStartPC),
++    // and the index registers, so the distiller can decompose an indexed read's
++    // effective address into (base, index) for VSA-style table recovery.
++    inline uint_least16_t membusInstrStartPC() const { return m_membusInstrStartPC; }
++    inline uint8_t membusRegX() const { return Register_X; }
++    inline uint8_t membusRegY() const { return Register_Y; }
++
+     inline void cpuWrite(uint_least16_t addr, uint8_t data) { dataBus.cpuWrite(addr, data); }
+ 
+     void reset();
 diff --git a/src/c64/c64.cpp b/src/c64/c64.cpp
-index b96881a8..767b0cd2 100644
+index b96881a8..8b5bc888 100644
 --- a/src/c64/c64.cpp
 +++ b/src/c64/c64.cpp
-@@ -89,6 +89,12 @@ c64::c64() :
+@@ -89,6 +89,39 @@ c64::c64() :
      cpu(eventScheduler, cpubus)
  {
      resetIoBank();
@@ -12,6 +94,33 @@ index b96881a8..767b0cd2 100644
 +            return static_cast<int64_t>(es->getTime(EVENT_CLOCK_PHI1));
 +        };
 +    MemBusTrace::instance().clockCtx = &eventScheduler;
++    // membus-trace: register a PC getter (issuing instruction's start PC) the
++    // same way the clock getter is registered, so each access is attributed to
++    // the code site that issued it (P1 in the recovery design).
++    MemBusTrace::instance().pcFn =
++        [](void *ctx) -> uint16_t {
++            MOS6510 *c = static_cast<MOS6510 *>(ctx);
++            return static_cast<uint16_t>(c->membusInstrStartPC());
++        };
++    MemBusTrace::instance().pcCtx = &cpu;
++    // membus-trace: index registers (for indexed-read VSA base/stride/length) and
++    // a live RAM-image getter (for the post-init song-data snapshot). readMemByte
++    // peeks raw RAM regardless of banking -- the program image, not the IO bank.
++    MemBusTrace::instance().xFn =
++        [](void *ctx) -> uint8_t {
++            return static_cast<MOS6510 *>(ctx)->membusRegX();
++        };
++    MemBusTrace::instance().xCtx = &cpu;
++    MemBusTrace::instance().yFn =
++        [](void *ctx) -> uint8_t {
++            return static_cast<MOS6510 *>(ctx)->membusRegY();
++        };
++    MemBusTrace::instance().yCtx = &cpu;
++    MemBusTrace::instance().ramFn =
++        [](void *ctx, uint16_t addr) -> uint8_t {
++            return static_cast<MMU *>(ctx)->readMemByte(addr);
++        };
++    MemBusTrace::instance().ramCtx = &mmu;
  }
  
  void c64::resetIoBank()
@@ -47,47 +156,146 @@ index 691ab7f8..e82f4a3b 100644
          if (addr >= 0x0400 && addr <= 0x07ff)
 diff --git a/src/c64/membus_trace.h b/src/c64/membus_trace.h
 new file mode 100644
-index 00000000..bc71c03a
+index 00000000..b6d98387
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,62 @@
+@@ -0,0 +1,235 @@
 +/*
-+ * membus_trace.h - minimal CPU memory-bus instrumentation for white-box SID
-+ * recovery. Not part of upstream libsidplayfp. Scratch use only.
++ * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
++ * Not part of upstream libsidplayfp. Scratch use only.
 + *
-+ * A process-global recorder. The CPU bus (c64cpubus) reports every read/write;
-+ * the c64 object registers a clock getter so each access is cycle-timestamped.
++ * The OLD design streamed every CPU bus cycle to disk (a multi-GB raw trace per
++ * tune) and partitioned it offline in Python -- hopeless at 60,000 tunes. This
++ * recorder instead DISTILLS the execution IN the emulator into a few-KB
++ * structured artifact and emits it once, at the end of the run. Nothing is
++ * streamed; peak memory is bounded by a handful of 64 KiB arrays plus small maps.
++ *
++ * What it accumulates (see SDST artifact format in sidtrace.cpp / the Python
++ * reader bacc/generic/distill.py):
++ *
++ *  - Per-address ACCESS-TYPE map (the SMC-correct classifier). For every address
++ *    the recorder ORs in, per phase (init / play), the access kinds it saw:
++ *    instruction-fetch (EXEC), data-read (READ), data-write (WRITE). The CPU
++ *    core marks an opcode/operand fetch via recordFetch(); ordinary operand and
++ *    data cycles come through record(). From these:
++ *      SMC          = EXEC_PLAY & WRITE_PLAY  (a location both executed AND
++ *                     written during play -- self-modifying code, NOT song data)
++ *      song-data    = READ_PLAY & !WRITE_PLAY & !EXEC (read as data during play,
++ *                     never written during play, never executed -- the
++ *                     init/load-resident table the player only reads).
++ *    Classifying by access TYPE (not by the fragile write-set subtraction) is
++ *    what makes SMC handling correct: SMC operand writes are code modification,
++ *    excluded from song data because the location is also EXEC, not because we
++ *    happened to see a write.
++ *
++ *  - Post-init RAM SNAPSHOT. At the init->play boundary the host calls
++ *    snapshotRam(); the recorder copies the live 64 KiB image (via a host getter)
++ *    so the song bytes are captured verbatim once, not reconstructed from writes.
++ *
++ *  - PC-tagged SID-write summary. Per (issuing PC, SID register) the count and a
++ *    representative value -- voice-lane attribution by code identity, a few dozen
++ *    entries, not every cycle.
++ *
++ *  - Indexed-read / table-access summary (VSA-style). Per issuing PC of an
++ *    indexed read, the base (= effective addr - index), element stride, index
++ *    min/max, and access count -- surfaces table base / element-size / length /
++ *    traversal without the raw read stream.
++ *
++ * A process-global singleton. The c64 object registers getters for the cycle,
++ * the issuing PC, the index register, and the RAM image; the host (sidtrace.cpp)
++ * sets the phase around the init/play calls and triggers the post-init snapshot.
 + * Logging is gated by 'enabled' so normal playback stays fast.
 + */
 +#ifndef MEMBUS_TRACE_H
 +#define MEMBUS_TRACE_H
 +
 +#include <cstdint>
-+#include <cstdio>
++#include <cstring>
++#include <map>
 +#include <vector>
 +
 +namespace libsidplayfp
 +{
 +
-+struct MemAccess
++// Execution phase a record was issued in (host-set).
++enum MemPhase : uint8_t
 +{
-+    int64_t cycle;        // PHI1 cycle at access
++    PHASE_BOOT = 0,   // emulator boot / before the tune's init call
++    PHASE_INIT = 1,   // inside the tune init (subtune select / table depack)
++    PHASE_PLAY = 2,   // steady per-frame play loop
++};
++
++// Per-address access-type accumulator bits (the SMC-correct classifier).
++enum AccBits : uint8_t
++{
++    ACC_EXEC_INIT  = 1 << 0,  // fetched as code during init
++    ACC_READ_INIT  = 1 << 1,  // read as data during init
++    ACC_WRITE_INIT = 1 << 2,  // written during init
++    ACC_EXEC_PLAY  = 1 << 3,  // fetched as code during play
++    ACC_READ_PLAY  = 1 << 4,  // read as data during play
++    ACC_WRITE_PLAY = 1 << 5,  // written during play
++};
++
++// One PC-tagged SID-register-write summary entry.
++struct SidWrSummary
++{
++    uint64_t count = 0;
++    uint8_t  lastVal = 0;   // representative (most recent) value written
++};
++
++// One timestamped SID register write (for the per-frame render/dump gate). This
++// is the ONLY timestamped stream kept -- it is tiny (one ~25-write burst per
++// frame), unlike the retired multi-GB full bus trace.
++struct SidWrEvent
++{
++    int64_t  cycle;
 +    uint16_t addr;
++    uint8_t  reg;
 +    uint8_t  val;
-+    uint8_t  rw;          // 0 = read, 1 = write
++};
++
++// One indexed-read (VSA) summary entry, keyed by issuing PC.
++struct IdxSummary
++{
++    uint64_t count = 0;
++    uint16_t base = 0;       // effective addr - index at first sighting
++    int32_t  strideGuess = 0;// dominant inter-access address delta (best effort)
++    uint16_t lastAddr = 0;
++    uint8_t  idxMin = 0xff;
++    uint8_t  idxMax = 0;
++    bool     baseSet = false;
 +};
 +
 +class MemBusTrace
 +{
 +public:
 +    bool enabled = false;
++    uint8_t phase = PHASE_BOOT;
 +
-+    // clock getter, installed by the c64 object
-+    typedef int64_t (*ClockFn)(void *ctx);
-+    ClockFn clockFn = nullptr;
-+    void   *clockCtx = nullptr;
++    // Getters installed by the c64 object (mirror the existing clock getter).
++    typedef int64_t  (*ClockFn)(void *ctx);
++    typedef uint16_t (*U16Fn)(void *ctx);
++    typedef uint8_t  (*U8Fn)(void *ctx);
++    typedef uint8_t  (*RamFn)(void *ctx, uint16_t addr);
 +
-+    std::vector<MemAccess> accesses;
++    ClockFn clockFn = nullptr; void *clockCtx = nullptr;
++    U16Fn   pcFn    = nullptr; void *pcCtx    = nullptr;  // issuing instr start PC
++    U8Fn    xFn     = nullptr; void *xCtx     = nullptr;  // X index register
++    U8Fn    yFn     = nullptr; void *yCtx     = nullptr;  // Y index register
++    RamFn   ramFn   = nullptr; void *ramCtx   = nullptr;  // live RAM byte getter
++
++    // --- distilled state (bounded; never grows with run length) ---
++    uint8_t  acc[65536];            // per-address AccBits
++    uint8_t  ramSnapshot[65536];    // post-init RAM image (verbatim song bytes)
++    bool     ramSnapshotTaken = false;
++    int64_t  firstSidWriteCycle = -1;  // anchor hint for the play phase
++
++    // PC-tagged SID writes: key = (pc << 5) | reg(0..31).
++    std::map<uint32_t, SidWrSummary> sidWrites;
++    // Indexed reads keyed by issuing PC.
++    std::map<uint16_t, IdxSummary> idxReads;
++    // Timestamped SID-write stream (small; for the per-frame render gate).
++    std::vector<SidWrEvent> sidStream;
 +
 +    static MemBusTrace &instance()
 +    {
@@ -95,19 +303,93 @@ index 00000000..bc71c03a
 +        return inst;
 +    }
 +
-+    inline int64_t now() const
-+    {
-+        return clockFn ? clockFn(clockCtx) : 0;
-+    }
++    inline int64_t  now() const { return clockFn ? clockFn(clockCtx) : 0; }
++    inline uint16_t pc()  const { return pcFn ? pcFn(pcCtx) : 0; }
++    inline uint8_t  xreg()const { return xFn ? xFn(xCtx) : 0; }
++    inline uint8_t  yreg()const { return yFn ? yFn(yCtx) : 0; }
 +
++    // A normal data access (read or write) on the bus.
 +    inline void record(uint16_t addr, uint8_t val, uint8_t rw)
 +    {
 +        if (!enabled) return;
-+        accesses.push_back(MemAccess{ now(), addr, val, rw });
++        const bool play = (phase == PHASE_PLAY);
++        if (rw)
++            acc[addr] |= play ? ACC_WRITE_PLAY : ACC_WRITE_INIT;
++        else
++        {
++            acc[addr] |= play ? ACC_READ_PLAY : ACC_READ_INIT;
++            recordIndexedRead(addr);
++        }
++        if (rw && addr >= 0xD400 && addr <= 0xD7FF)
++            recordSidWrite(addr, val);
 +    }
 +
-+    void clear() { accesses.clear(); }
-+    void reserve(size_t n) { accesses.reserve(n); }
++    // An instruction opcode/operand fetch (issued by the CPU core).
++    inline void recordFetch(uint16_t addr)
++    {
++        if (!enabled) return;
++        acc[addr] |= (phase == PHASE_PLAY) ? ACC_EXEC_PLAY : ACC_EXEC_INIT;
++    }
++
++    // Capture the live RAM image once, at the init->play boundary.
++    inline void snapshotRam()
++    {
++        if (!ramFn) return;
++        for (uint32_t a = 0; a < 65536; ++a)
++            ramSnapshot[a] = ramFn(ramCtx, (uint16_t)a);
++        ramSnapshotTaken = true;
++    }
++
++    void clear()
++    {
++        std::memset(acc, 0, sizeof(acc));
++        std::memset(ramSnapshot, 0, sizeof(ramSnapshot));
++        ramSnapshotTaken = false;
++        firstSidWriteCycle = -1;
++        sidWrites.clear();
++        idxReads.clear();
++        sidStream.clear();
++    }
++
++private:
++    inline void recordSidWrite(uint16_t addr, uint8_t val)
++    {
++        if (firstSidWriteCycle < 0 && phase == PHASE_PLAY)
++            firstSidWriteCycle = now();
++        const uint8_t reg = (uint8_t)(addr & 0x1f);
++        SidWrSummary &s = sidWrites[((uint32_t)pc() << 5) | reg];
++        s.count++;
++        s.lastVal = val;
++        sidStream.push_back(SidWrEvent{ now(), addr, reg, val });
++    }
++
++    inline void recordIndexedRead(uint16_t addr)
++    {
++        // Only summarise reads issued during play (the table walks of interest)
++        // that came through an index register (effective addr != base => X|Y!=0
++        // for at least some accesses of this PC). We key by issuing PC and fold
++        // base = addr - index, tracking the index span and a stride guess.
++        if (phase != PHASE_PLAY) return;
++        const uint8_t x = xreg(), y = yreg();
++        const uint8_t idx = x >= y ? x : y;   // dominant index; best effort
++        if (idx == 0)
++            return;  // non-indexed (or index 0) -- not a table traversal signal
++        const uint16_t p = pc();
++        IdxSummary &s = idxReads[p];
++        const uint16_t base = (uint16_t)(addr - idx);
++        if (!s.baseSet) { s.base = base; s.baseSet = true; }
++        if (s.count)
++        {
++            const int32_t d = (int32_t)addr - (int32_t)s.lastAddr;
++            if (d != 0 && (s.strideGuess == 0 ||
++                           (d > 0 && d < s.strideGuess)))
++                s.strideGuess = d;  // smallest positive step ~ element stride
++        }
++        s.lastAddr = addr;
++        if (idx < s.idxMin) s.idxMin = idx;
++        if (idx > s.idxMax) s.idxMax = idx;
++        s.count++;
++    }
 +};
 +
 +} // namespace libsidplayfp

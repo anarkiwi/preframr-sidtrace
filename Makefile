@@ -58,8 +58,13 @@ $(CONFIG_STAMP): $(PATCH_STAMP)
 	@touch $@
 
 # 3. Build the static libsidplayfp + sidlite builder libs.
+#    automake's per-object .deps/*.Tpo files are created lazily on the first
+#    compile; under -j a cold build can race on a freshly-generated .deps dir
+#    ("mv: cannot stat '...Tpo'"). The objects still compile, so retry once
+#    (deps are populated by then) before failing -- keeps cold parallel builds
+#    (CI) green without serialising the whole build.
 $(LIB_A) $(SIDLITE_A): $(CONFIG_STAMP)
-	$(MAKE) -C $(LIBDIR) -j$(NPROC)
+	$(MAKE) -C $(LIBDIR) -j$(NPROC) || $(MAKE) -C $(LIBDIR) -j$(NPROC)
 
 lib: $(LIB_A) $(SIDLITE_A)
 
