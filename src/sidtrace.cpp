@@ -74,9 +74,15 @@ static std::vector<uint8_t> readFile(const char *path)
  *     TYPE, never by write-set subtraction.
  *       tag char[4] "ACMP"; nbytes u32; then nbytes of (u16 count, u8 bits).
  *
- *   SECTION "SNAP" (post-init RAM snapshot, RLE):  the verbatim song bytes,
- *     captured once at the init->play boundary, RLE'd (count u16, byte u8).
- *       tag char[4] "SNAP"; nbytes u32; then nbytes of (u16 count, u8 byte).
+ *   SECTION "SNAP" (post-init RAM snapshot):  the verbatim bytes the recovery
+ *     lifts as constants K by identity, as (addr u16, len u16, bytes[len]) runs.
+ *     Two eligibility classes: (1) the classic resident song-data region (RAM,
+ *     never written/executed during play, inside the loaded image span); (2) ANY
+ *     cell READ AS DATA during play within zero page or the loaded image span --
+ *     so a self-relocating generative player's zero-page generator tables (A Mind
+ *     keeps its tables in EXEC'd zp $f3/$f7) are captured too. The host classifies
+ *     code/data/SMC via ACMP; SNAP is just the verbatim byte value.
+ *       tag char[4] "SNAP"; nbytes u32; then the (addr,len,bytes) runs.
  *
  *   SECTION "SIDW" (PC-tagged SID-write summary):  voice-lane attribution by
  *     code site.  count u32 entries of (pc u16, reg u8, _pad u8, n u32,
@@ -87,6 +93,60 @@ static std::vector<uint8_t> readFile(const char *path)
  *     entries of (pc u16, base u16, stride i32, idxMin u8, idxMax u8,
  *     _pad u16, n u32) -- table base / element size / length / traversal.
  *       tag char[4] "IDXR"; nentries u32; then the entries.
+ *
+ *   SECTION "SIDDF" (per-SID-write DATA-FLOW summary; design 3.1).  Keyed by
+ *     (issuing PC, SID register) -- the SAME key space as SIDW, so O(code sites)
+ *     NOT O(frames).  For each STA $D4xx code site, a BOUNDED in-emulator backward
+ *     dynamic slice (over a ring buffer of retired play-call instructions): the
+ *     slice PC set (the generator's code), the classified leaves (immediate /
+ *     ram_read / state_cell[=SMC] / exogenous / out-of-window via the access-type
+ *     map), the ALU op sequence on the value chain, a strided-interval VSA for any
+ *     indexed read feeding THIS write, and min/max/first written value.  This is
+ *     the per-write computation DAG the recurrence-recovery host needs.  Tag is 4
+ *     bytes "SDDF".  Layout: tag; nentries u32; then per entry:
+ *        pc u16, reg u8, flags u8 (bit0=hasStride, bit1=anyOutOfWindow),
+ *        count u32,
+ *        valLo u8, valHi u8, valFirst u8, _pad u8,
+ *        strideBase u16, strideStep i32, strideIdxMin u8, strideIdxMax u8,
+ *        nPcs u16,   then nPcs * (pc u16),
+ *        nLeaves u16, then nLeaves * (kind u8, _pad u8, addr u16, value u8, _pad u8),
+ *        nOps u16,   then nOps * (op u8),
+ *        nValSeq u16, then nValSeq * (value u8).  (SDDF writes nValSeq=0; the field
+ *        carries the mid-call value sequence for SDCU -- see below.)
+ *
+ *   SECTION "STSQ" (bounded inter-frame STATE-CELL sample sequence; design 3.2).
+ *     For each cell SIDDF flagged as a state leaf, a bounded sequence of its
+ *     value across play-calls (frames): the inter-frame state samples Stage C
+ *     (Daikon-style recurrence inference / Berlekamp-Massey) fits.  Keyed by RAM
+ *     address; O(state cells * M), FLAT vs frame count (M is capped).  Tag is 4
+ *     bytes "STSQ".  Layout: tag; nentries u32; then per entry:
+ *        addr u16, flags u8 (bit0=holdsToEnd, bit1=wide), _pad u8,
+ *        totalFrames u32, firstSeenFrame u32, nSamples u16,
+ *        then nSamples * (sample u8).  (Cells are byte-wide in practice; the
+ *        wide flag is reserved for a future 16-bit pair and is never set here.)
+ *     firstSeenFrame: global play-call index of sample[0] (a cell that becomes a
+ *     SIDDF state leaf mid-run starts sampling later; the host aligns to the
+ *     master frame grid with this).
+ *     holdsToEnd: the constant-stride (first-difference, mod byte width)
+ *     recurrence implied by the sample prefix kept holding to the end of the
+ *     capture (a cheap in-emulator running check); the host can trust a short
+ *     window without re-deriving over the whole run.  wide: a sample exceeded
+ *     0xff (a 16-bit cell pair); samples are u8 in practice.
+ *
+ *   SECTION "SDCU" (per-state-cell UPDATE data-flow summary; design 2.2/2.3).
+ *     Same variable-length entry layout as SDDF, but keyed by the state-cell
+ *     ADDRESS (in the `pc` field; `reg` unused). For a fast mid-call SMC
+ *     accumulator the SID-write slice bottoms out at the shadow cell as a LEAF
+ *     (the blit just copies it to the register); SDCU is the backward slice of the
+ *     STORE (or in-place INC/DEC/shift RMW) that DEFINED the cell earlier in the
+ *     SAME play-call -- the update DAG cell' = f(cell, C, K, immediates) the host
+ *     generalizes into U. Only cells SIDDF flagged as state leaves are emitted.
+ *     O(state cells), flat vs frame count.  Tag char[4] "SDCU".  The trailing
+ *     nValSeq field carries the cell's MID-CALL value sequence (the value the
+ *     update wrote, sampled at the update site, NOT at the call boundary): the
+ *     genuine generator state stream the host feeds to Berlekamp-Massey for the
+ *     LFSR-vs-not verdict (a fast SMC cell's call-boundary STATESEQ is a constant
+ *     residue and useless for this).  Bounded SDCU_VALSEQ_M, flat vs frames.
  *
  *   SECTION "END\0" terminates.
  *
@@ -141,39 +201,51 @@ static long emit_distill(const char *path, MemBusTrace &tr,
         fseek(f, end, SEEK_SET);
     }
 
-    // SNAP: the post-init RAM snapshot, SPARSE -- only the song-data-candidate
-    // bytes (RAM, read as data during play, never written during play, never
-    // executed: the SMC-correct song-data classifier), stored as contiguous
-    // (addr u16, len u16, bytes[len]) runs. This keeps the artifact tiny: we do
-    // NOT snapshot the whole 64 KiB (most of which is code, scratch, or unused),
-    // only the bytes the recovery actually lifts. SMC locations (EXEC & WRITE)
-    // are excluded by the !EXEC term, so self-modified operands never enter the
-    // song data.
+    // SNAP: the post-init RAM snapshot, SPARSE -- the bytes the recovery lifts as
+    // constants K by IDENTITY (design 2.4), stored as contiguous (addr u16, len
+    // u16, bytes[len]) runs. This keeps the artifact tiny: we do NOT snapshot the
+    // whole 64 KiB (most of which is code, scratch, or unused), only the bytes O
+    // (or a state-cell filler) dereferenced.
+    //
+    // TWO eligibility classes (design 2.4 + 3.0 "widen SNAP"):
+    //  (1) the song-data region: RAM, never written during play, never executed --
+    //      the classic init/load-resident table the player only reads, bounded to
+    //      the loaded image span [loadAddr, loadAddr+c64dataLen). SMC operands
+    //      (EXEC & WRITE) are excluded here by the !EXEC term.
+    //  (2) ANY cell READ AS DATA during play (ACC_READ_PLAY), regardless of EXEC.
+    //      The song-data-region heuristic is a FORMAT ASSUMPTION; a generative /
+    //      self-relocating player (A Mind Is Born relocates its whole player +
+    //      its small generator tables into zero page, so the table O dereferences
+    //      at runtime $f7 is ALSO EXEC there) keeps its constant tables in cells
+    //      that are EXEC_PLAY. The generic recovery must lift K from wherever O
+    //      dereferenced, INCLUDING executed zero page. We therefore also snapshot
+    //      every RAM cell read as data during play. The host classifies code vs
+    //      data vs SMC via ACMP -- the snapshot is just the verbatim byte value at
+    //      the dereferenced address, never a structure claim. Still bounded: a
+    //      play-call reads only a handful of distinct data cells per axis.
     {
         fwrite("SNAP", 1, 4, f);
         long lenPos = ftell(f);
         wr_u32(f, 0);
         long start = ftell(f);
-        // A byte is ELIGIBLE for the song-data region if it is RAM, never written
-        // during play, and never executed -- the SMC-correct "not code, not
-        // mutable state" filter. Within a maximal eligible run we emit the run
-        // ONLY if it contains at least one byte actually READ as data during play
-        // (so untouched RAM and pure init scratch are dropped, but the gaps
-        // between read table entries -- patterns/instruments not yet traversed in
-        // this capture window -- are kept, exactly like the proven identity lift).
-        // Bound the song-data search to the loaded program image span
-        // [loadAddr, loadAddr + c64dataLen): the packed/depacked song tables live
-        // inside the player's own loaded image (HVSC contract). This keeps stray
-        // reads of untouched high RAM out of the region.
         const uint32_t loadLo = ti ? ti->loadAddr() : 0;
         const uint32_t loadHi = ti ? (loadLo + ti->c64dataLen()) : 0x10000;
         auto eligible = [&](uint32_t a) -> bool {
             if (a < 0x0002 || a >= 0xd000) return false;   // RAM only, skip IO
-            if (a < loadLo || a >= loadHi) return false;   // loaded image only
             const uint8_t b = tr.acc[a];
             const bool writePlay = b & libsidplayfp::ACC_WRITE_PLAY;
+            const bool readPlay  = b & libsidplayfp::ACC_READ_PLAY;
             const bool execAny   = b & (libsidplayfp::ACC_EXEC_INIT |
                                         libsidplayfp::ACC_EXEC_PLAY);
+            // (2) read as data during play within zero page OR the loaded image
+            // span: the dereferenced constant/table, including a relocated
+            // player's executed zero page (A Mind keeps its generator tables in
+            // zp $f3/$f7, EXEC there). Bounded to zp+image so a busy player's
+            // reads of large scratch/high-RAM regions don't bloat the snapshot.
+            if (readPlay && (a < 0x0100 || (a >= loadLo && a < loadHi)))
+                return true;
+            // (1) classic resident song-data table inside the loaded image span.
+            if (a < loadLo || a >= loadHi) return false;
             return !writePlay && !execAny;
         };
         uint32_t a = 0;
@@ -237,6 +309,142 @@ static long emit_distill(const char *path, MemBusTrace &tr,
             wr_u16(f, 0);
             wr_u32(f, (uint32_t)kv.second.count);
         }
+    }
+
+    // SIDDF: per-(PC,reg) data-flow summary (the per-write computation DAG).
+    {
+        fwrite("SDDF", 1, 4, f);
+        wr_u32(f, (uint32_t)tr.siddf.size());
+        for (const auto &kv : tr.siddf)
+        {
+            const uint16_t pc = (uint16_t)(kv.first >> 5);
+            const uint8_t  reg = (uint8_t)(kv.first & 0x1f);
+            const libsidplayfp::SiddfSummary &s = kv.second;
+            uint8_t flags = 0;
+            if (s.hasStride)      flags |= 0x01;
+            if (s.anyOutOfWindow) flags |= 0x02;
+            wr_u16(f, pc);
+            wr_u8(f, reg);
+            wr_u8(f, flags);
+            wr_u32(f, (uint32_t)s.count);
+            wr_u8(f, s.valSeen ? s.valLo : 0);
+            wr_u8(f, s.valHi);
+            wr_u8(f, s.valFirst);
+            wr_u8(f, 0);
+            wr_u16(f, s.strideBase);
+            wr_i32(f, s.strideStep);
+            wr_u8(f, s.strideIdxMin == 0xff ? 0 : s.strideIdxMin);
+            wr_u8(f, s.strideIdxMax);
+            wr_u16(f, (uint16_t)s.slicePcs.size());
+            for (uint16_t p : s.slicePcs) wr_u16(f, p);
+            wr_u16(f, (uint16_t)s.leaves.size());
+            for (const auto &l : s.leaves)
+            {
+                wr_u8(f, l.kind);
+                wr_u8(f, 0);
+                wr_u16(f, l.addr);
+                wr_u8(f, l.value);
+                wr_u8(f, 0);
+            }
+            wr_u16(f, (uint16_t)s.opSeq.size());
+            for (uint8_t op : s.opSeq) wr_u8(f, op);
+            // mid-call value sequence (SDDF carries none; field present for a
+            // uniform SDDF/SDCU entry shape so one reader parses both).
+            wr_u16(f, (uint16_t)s.valSeq.size());
+            for (uint8_t v : s.valSeq) wr_u8(f, v);
+        }
+    }
+
+    // STSQ: bounded inter-frame state-cell sample sequences, filtered to the
+    // cells SIDDF flagged as state leaves (design 3.2). O(state cells * M), flat.
+    {
+        fwrite("STSQ", 1, 4, f);
+        long nentPos = ftell(f);
+        wr_u32(f, 0);                          // nentries, backpatched
+        uint32_t nent = 0;
+        for (const auto &kv : tr.stateSeq)
+        {
+            const uint16_t addr = kv.first;
+            if (!tr.isSiddfStateCell(addr)) continue;   // only real state cells
+            const libsidplayfp::StateSeqCell &c = kv.second;
+            uint8_t flags = 0;
+            if (c.constDiff)  flags |= 0x01;   // holds_to_end
+            if (c.wide)       flags |= 0x02;
+            wr_u16(f, addr);
+            wr_u8(f, flags);
+            wr_u8(f, 0);
+            wr_u32(f, (uint32_t)c.totalFrames);
+            wr_u32(f, (uint32_t)c.firstSeenFrame);
+            wr_u16(f, (uint16_t)c.nSamples);
+            for (uint32_t i = 0; i < c.nSamples; ++i)
+                wr_u8(f, (uint8_t)c.samples[i]);
+            nent++;
+        }
+        long end = ftell(f);
+        fseek(f, nentPos, SEEK_SET);
+        wr_u32(f, nent);
+        fseek(f, end, SEEK_SET);
+    }
+
+    // SDCU: per-state-cell UPDATE data-flow summary (design 2.2/2.3). Same
+    // variable-length entry layout as SDDF, but keyed by the state-cell ADDRESS
+    // (written into the `pc` field; `reg` is unused/0). For a fast mid-call SMC
+    // accumulator the SID-write slice bottoms out at the cell as a leaf (the blit
+    // just copies the shadow cell to the register); SDCU is the backward slice of
+    // the STORE that DEFINED the cell earlier in the SAME play-call -- the update
+    // DAG cell' = f(cell, C, K, immediates) the host generalizes into U. Only the
+    // cells SIDDF flagged as state leaves are emitted (the handful that drive an
+    // axis), keeping it O(state cells), flat vs frame count. Tag "SDCU".
+    {
+        fwrite("SDCU", 1, 4, f);
+        long nentPos = ftell(f);
+        wr_u32(f, 0);                          // nentries, backpatched
+        uint32_t nent = 0;
+        for (const auto &kv : tr.sdcu)
+        {
+            const uint16_t cellAddr = kv.first;
+            if (!tr.isSiddfStateCell(cellAddr)) continue;  // only real state cells
+            const libsidplayfp::SiddfSummary &s = kv.second;
+            uint8_t flags = 0;
+            if (s.hasStride)      flags |= 0x01;
+            if (s.anyOutOfWindow) flags |= 0x02;
+            wr_u16(f, cellAddr);               // key: the state-cell address
+            wr_u8(f, 0);                       // reg (unused for SDCU)
+            wr_u8(f, flags);
+            wr_u32(f, (uint32_t)s.count);
+            wr_u8(f, s.valSeen ? s.valLo : 0);
+            wr_u8(f, s.valHi);
+            wr_u8(f, s.valFirst);
+            wr_u8(f, 0);
+            wr_u16(f, s.strideBase);
+            wr_i32(f, s.strideStep);
+            wr_u8(f, s.strideIdxMin == 0xff ? 0 : s.strideIdxMin);
+            wr_u8(f, s.strideIdxMax);
+            wr_u16(f, (uint16_t)s.slicePcs.size());
+            for (uint16_t p : s.slicePcs) wr_u16(f, p);
+            wr_u16(f, (uint16_t)s.leaves.size());
+            for (const auto &l : s.leaves)
+            {
+                wr_u8(f, l.kind);
+                wr_u8(f, 0);
+                wr_u16(f, l.addr);
+                wr_u8(f, l.value);
+                wr_u8(f, 0);
+            }
+            wr_u16(f, (uint16_t)s.opSeq.size());
+            for (uint8_t op : s.opSeq) wr_u8(f, op);
+            // mid-call value sequence: the genuine generator state stream sampled
+            // at the cell's UPDATE site (NOT at the call boundary). This is what the
+            // host feeds to Berlekamp-Massey for the LFSR-vs-not verdict (design
+            // 2.5/2.7). Bounded SDCU_VALSEQ_M, flat vs frame count.
+            wr_u16(f, (uint16_t)s.valSeq.size());
+            for (uint8_t v : s.valSeq) wr_u8(f, v);
+            nent++;
+        }
+        long end = ftell(f);
+        fseek(f, nentPos, SEEK_SET);
+        wr_u32(f, nent);
+        fseek(f, end, SEEK_SET);
     }
 
     fwrite("END\0", 1, 4, f);
@@ -394,6 +602,21 @@ int main(int argc, char **argv)
         fclose(fs);
     }
     const uint64_t nSid = (uint64_t)tr.sidStream.size();
+
+    // Debug aid (off by default): dump the full post-init RAM image so the
+    // zero-page-relocated players can be disassembled offline. Not part of the
+    // SDST artifact.
+    if (getenv("SIDTRACE_DUMP_RAM"))
+    {
+        const std::string rp = outPrefix + ".ram.bin";
+        FILE *fr = fopen(rp.c_str(), "wb");
+        if (fr) { fwrite(tr.ramSnapshot, 1, 65536, fr); fclose(fr); }
+    }
+
+    // Reclassify SIDDF memory leaves against the final access-type map (a state
+    // cell first read on frame 1 before its play-write would otherwise look
+    // read-only). Deterministic: depends only on the accumulated acc map.
+    tr.finalizeLeaves();
 
     // --- emit the compact distilled artifact (SDST) ---
     const long distillBytes =

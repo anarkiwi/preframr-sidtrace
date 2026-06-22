@@ -8,10 +8,29 @@ sidtrace emits two files per tune:
 
 * ``<prefix>.distill.bin`` -- the compact SDST artifact: the in-emulator
   DISTILLATION of the run (access-type map, post-init song-data snapshot,
-  PC-tagged SID-write summary, indexed-read VSA summary). A few KB per tune. This
-  REPLACES the retired multi-GB cycle-by-cycle bus trace; the analysis is done in
-  C++ during emulation, not in Python over a raw stream. The exact layout is in
-  ``src/sidtrace.cpp`` (and ``parse_sdst`` below).
+  PC-tagged SID-write summary, indexed-read VSA summary, and the per-SID-write
+  DATA-FLOW summary SIDDF). A few KB per tune. This REPLACES the retired multi-GB
+  cycle-by-cycle bus trace; the analysis is done in C++ during emulation, not in
+  Python over a raw stream. The exact layout is in ``src/sidtrace.cpp`` (and
+  ``parse_sdst`` below).
+
+  SIDDF is the Stage-1 addition (design 3.1): for each STA $D4xx code site
+  (keyed by (PC,reg), the same key space as SIDW, so O(code sites) not O(frames))
+  it carries a bounded in-emulator backward dynamic slice of the written value --
+  the slice PCs, classified leaves (immediate / ram_read / state_cell[=SMC] /
+  exogenous / out_of_window), the value-chain ALU op sequence, a strided-interval
+  VSA for any indexed read feeding the write, and the min/max/first value. It
+  turns "PC wrote register r" into "here is HOW r was computed" and stays flat as
+  the capture window grows.
+
+  STSQ (design 3.2) is the inter-frame sample sequence of each SIDDF-flagged state
+  cell (Stage-C recurrence/Berlekamp-Massey input). SDCU (design 2.2/2.3, Stage 3)
+  is the per-state-cell UPDATE DAG: for a fast mid-call SMC accumulator the
+  SID-write slice bottoms out at the shadow cell as a leaf, so SDCU carries the
+  backward slice of the STORE or in-place RMW that recomputed the cell -- the
+  update cell'=f(cell,...) the host generalizes into U. Keyed by cell address;
+  O(state cells), flat vs frames. (Both parse the same SiddfSite shape; for SDCU
+  the `pc` field is the state-cell address.)
 """
 
 import struct
@@ -33,6 +52,38 @@ ACC_WRITE_PLAY = 1 << 5
 
 _SIDW_ENTRY = struct.Struct("<HBBIB3x")  # pc, reg, pad, count, lastVal, pad[3]
 _IDXR_ENTRY = struct.Struct("<HHiBBHI")  # pc, base, stride, idxMin, idxMax, pad, count
+
+# SIDDF (per-write data-flow summary, design 3.1). Variable-length entries.
+_SIDDF_HEAD = struct.Struct("<HBBIBBBxHiBB")
+#  pc u16, reg u8, flags u8, count u32, valLo u8, valHi u8, valFirst u8, pad u8,
+#  strideBase u16, strideStep i32, strideIdxMin u8, strideIdxMax u8
+_SIDDF_LEAF = struct.Struct("<BxHBx")  # kind u8, pad, addr u16, value u8, pad
+
+# STSQ (inter-frame state-cell sample sequence, design 3.2). Variable-length.
+#  addr u16, flags u8, pad, totalFrames u32, firstSeenFrame u32, nSamples u16
+_STSQ_HEAD = struct.Struct("<HBxIIH")
+
+# Leaf kinds (mirror membus_trace.h LeafKind).
+LK_IMMEDIATE = 0
+LK_RAM_READ = 1
+LK_STATE_CELL = 2
+LK_EXOGENOUS = 3
+LK_OUT_OF_WINDOW = 4
+LEAF_KIND_NAME = {
+    LK_IMMEDIATE: "immediate",
+    LK_RAM_READ: "ram_read",
+    LK_STATE_CELL: "state_cell",
+    LK_EXOGENOUS: "exogenous",
+    LK_OUT_OF_WINDOW: "out_of_window",
+}
+
+# ALU ops (mirror membus_trace.h AluOp).
+(ALU_NONE, ALU_ADC, ALU_SBC, ALU_AND, ALU_ORA, ALU_EOR, ALU_ASL, ALU_LSR,
+ ALU_ROL, ALU_ROR, ALU_INC, ALU_DEC, ALU_CMP) = range(13)
+ALU_NAME = {
+    0: "NONE", 1: "ADC", 2: "SBC", 3: "AND", 4: "ORA", 5: "EOR",
+    6: "ASL", 7: "LSR", 8: "ROL", 9: "ROR", 10: "INC", 11: "DEC", 12: "CMP",
+}
 
 
 def load_sidwr(path):
@@ -66,6 +117,9 @@ def parse_sdst(path):
     ram = np.zeros(65536, dtype=np.uint8)
     sid_writes = []
     idx_reads = []
+    siddf = []
+    stateseq = []
+    sdcu = []
     while off < len(buf):
         tag = buf[off : off + 4]
         off += 4
@@ -110,6 +164,71 @@ def parse_sdst(path):
                 )
                 off += _IDXR_ENTRY.size
                 idx_reads.append((pc, base, stride, imin, imax, count))
+        elif tag in (b"SDDF", b"SDCU"):
+            (nent,) = struct.unpack_from("<I", buf, off)
+            off += 4
+            dest = siddf if tag == b"SDDF" else sdcu
+            for _ in range(nent):
+                (
+                    pc, reg, flags, count, vlo, vhi, vfirst,
+                    sbase, sstep, simin, simax,
+                ) = _SIDDF_HEAD.unpack_from(buf, off)
+                off += _SIDDF_HEAD.size
+                (npcs,) = struct.unpack_from("<H", buf, off)
+                off += 2
+                pcs = list(struct.unpack_from(f"<{npcs}H", buf, off))
+                off += 2 * npcs
+                (nleaves,) = struct.unpack_from("<H", buf, off)
+                off += 2
+                leaves = []
+                for _ in range(nleaves):
+                    kind, addr, value = _SIDDF_LEAF.unpack_from(buf, off)
+                    off += _SIDDF_LEAF.size
+                    leaves.append((kind, addr, value))
+                (nops,) = struct.unpack_from("<H", buf, off)
+                off += 2
+                ops = list(struct.unpack_from(f"<{nops}B", buf, off)) if nops else []
+                off += nops
+                # mid-call value sequence (SDCU's genuine generator state stream;
+                # empty for SDDF). The BM input for the LFSR-vs-not verdict.
+                (nval,) = struct.unpack_from("<H", buf, off)
+                off += 2
+                valseq = (list(struct.unpack_from(f"<{nval}B", buf, off))
+                          if nval else [])
+                off += nval
+                dest.append(
+                    {
+                        "pc": pc, "reg": reg, "flags": flags, "count": count,
+                        "val_lo": vlo, "val_hi": vhi, "val_first": vfirst,
+                        "has_stride": bool(flags & 1),
+                        "any_out_of_window": bool(flags & 2),
+                        "stride_base": sbase, "stride_step": sstep,
+                        "stride_idx_min": simin, "stride_idx_max": simax,
+                        "slice_pcs": pcs, "leaves": leaves, "op_seq": ops,
+                        "val_seq": valseq,
+                    }
+                )
+        elif tag == b"STSQ":
+            (nent,) = struct.unpack_from("<I", buf, off)
+            off += 4
+            for _ in range(nent):
+                addr, flags, total_frames, first_seen, nsamp = _STSQ_HEAD.unpack_from(
+                    buf, off
+                )
+                off += _STSQ_HEAD.size
+                samples = list(struct.unpack_from(f"<{nsamp}B", buf, off))
+                off += nsamp
+                stateseq.append(
+                    {
+                        "addr": addr,
+                        "holds_to_end": bool(flags & 1),
+                        "wide": bool(flags & 2),
+                        "total_frames": total_frames,
+                        "first_seen_frame": first_seen,
+                        "n_samples": nsamp,
+                        "samples": samples,
+                    }
+                )
         else:
             raise ValueError(f"unknown SDST section {tag!r}")
 
@@ -127,6 +246,9 @@ def parse_sdst(path):
         "ram": ram,
         "sid_writes": sid_writes,
         "idx_reads": idx_reads,
+        "siddf": siddf,
+        "stateseq": stateseq,
+        "sdcu": sdcu,
     }
 
 

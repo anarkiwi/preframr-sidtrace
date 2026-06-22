@@ -33,6 +33,9 @@ from sidtrace_records import (  # noqa: E402
     ACC_EXEC_PLAY,
     ACC_READ_PLAY,
     ACC_WRITE_PLAY,
+    ALU_INC,
+    LK_IMMEDIATE,
+    LK_STATE_CELL,
     SIDWR_DT,
     load_sidwr,
     parse_meta,
@@ -191,6 +194,246 @@ def test_deterministic_over_many_runs(tmp_path, fixture_sid):
             )
         )
     assert len(digests) == 1, f"non-deterministic over 5 runs: {digests}"
+
+
+def test_siddf_present_and_keyed_by_pc_reg(trace):
+    """The per-write data-flow summary (SIDDF) exists and shares SIDW's (PC,reg)
+    key space -- it is O(code sites), not O(frames)."""
+    d = parse_sdst(trace["distill"])
+    assert d["siddf"], "no SIDDF data-flow summaries emitted"
+    sidw_keys = {(pc, reg) for pc, reg, _c, _v in d["sid_writes"]}
+    siddf_keys = {(e["pc"], e["reg"]) for e in d["siddf"]}
+    # every data-flow site corresponds to a real SID-write site
+    assert siddf_keys <= sidw_keys
+    # the regs covered include the fixture's distinct write registers
+    assert {0x00, 0x01, 0x04, 0x18} <= {e["reg"] for e in d["siddf"]}
+
+
+def test_siddf_classifies_state_vs_constant(trace):
+    """The fixture's freq-lo ($D400) is loaded from a RAM counter that is
+    INC'd every play-call -> its slice leaf must be a STATE_CELL (read+write
+    during play), NOT a constant. The immediate-loaded registers (#$11 ->
+    $D401, #$21 -> $D404, #$0F -> $D418) must surface an IMMEDIATE leaf and a
+    constant value range (val_lo == val_hi)."""
+    d = parse_sdst(trace["distill"])
+    by_reg = {e["reg"]: e for e in d["siddf"]}
+
+    fr = by_reg[0x00]  # freq-lo, fed by the INC'd counter
+    leaf_kinds = {k for k, _a, _v in fr["leaves"]}
+    assert LK_STATE_CELL in leaf_kinds, (
+        "freq-lo's counter source must classify as state_cell, not constant"
+    )
+    # the counter is genuinely mutable -> the written value is not constant
+    assert fr["val_lo"] != fr["val_hi"]
+
+    for reg in (0x01, 0x04, 0x18):  # immediate-loaded -> constant
+        e = by_reg[reg]
+        kinds = {k for k, _a, _v in e["leaves"]}
+        assert LK_IMMEDIATE in kinds, f"reg {reg:#x} should have an immediate leaf"
+        assert e["val_lo"] == e["val_hi"], f"reg {reg:#x} should be constant"
+
+
+def test_siddf_flat_vs_capture_length(tmp_path, fixture_sid):
+    """The decisive length-independence property: the SIDDF section size does NOT
+    grow with the number of frames captured (it is keyed by code site). Trace a
+    short and a long window and require the SIDDF byte count to be identical."""
+
+    def siddf_nbytes(distill_path):
+        buf = distill_path.read_bytes()
+        i = buf.find(b"SDDF")
+        assert i >= 0
+        # SDDF is followed by STSQ then END; measure to whichever comes first so
+        # the SIDDF size is isolated from the (separately-bounded) STSQ section.
+        j = buf.find(b"STSQ", i)
+        if j < 0:
+            j = buf.find(b"END\x00", i)
+        return (j if j >= 0 else len(buf)) - i
+
+    def trace_n(prefix, n):
+        subprocess.run(
+            [_sidtrace_bin(), str(fixture_sid), "1", str(n), str(prefix)],
+            check=True,
+        )
+        return Path(f"{prefix}.distill.bin")
+
+    short = trace_n(tmp_path / "short", 30)
+    long = trace_n(tmp_path / "long", 600)
+    sw_short = load_sidwr(Path(str(short).replace(".distill.bin", ".sidwr.bin")))
+    sw_long = load_sidwr(Path(str(long).replace(".distill.bin", ".sidwr.bin")))
+    assert sw_long.size > sw_short.size * 5, "long capture should have many more writes"
+    assert siddf_nbytes(short) == siddf_nbytes(long), (
+        "SIDDF size grew with capture length -- it must be O(code sites), not O(frames)"
+    )
+
+
+def test_stateseq_present_for_flagged_state_cells(trace):
+    """STATESEQ (design 3.2) carries an inter-frame sample sequence for every cell
+    SIDDF flagged as a state leaf. The fixture's freq-lo ($D400) is fed by a RAM
+    counter INC'd every play-call; that counter must appear in STATESEQ with a
+    monotone +1 sample sequence (and holds_to_end True -- a constant-stride
+    accumulator)."""
+    d = parse_sdst(trace["distill"])
+    assert d["stateseq"], "no STATESEQ sample sequences emitted"
+    # the set of STATESEQ cells must be exactly the SIDDF-flagged state cells
+    siddf_state = {
+        a for e in d["siddf"] for k, a, _v in e["leaves"] if k == LK_STATE_CELL
+    }
+    stseq_addrs = {e["addr"] for e in d["stateseq"]}
+    assert stseq_addrs == siddf_state, (
+        f"STATESEQ cells {sorted(stseq_addrs)} != SIDDF state cells "
+        f"{sorted(siddf_state)}"
+    )
+    # the counter cell's sequence is a clean +1 accumulator -> holds_to_end.
+    counter = next(e for e in d["stateseq"] if e["holds_to_end"])
+    s = counter["samples"]
+    assert len(s) >= 8
+    diffs = {(s[i + 1] - s[i]) & 0xFF for i in range(len(s) - 1)}
+    assert diffs == {1}, f"counter STATESEQ is not a +1 accumulator: diffs={diffs}"
+
+
+def test_stateseq_bounded_and_flat_vs_capture_length(tmp_path, fixture_sid):
+    """STATESEQ stays bounded (capped at M samples/cell) and does NOT grow once
+    the capture window exceeds M and all state cells are discovered: the section is
+    O(state cells * M), not O(frames). Trace two windows both >> M and require an
+    identical STATESEQ byte count."""
+
+    def stsq_nbytes(distill_path):
+        buf = distill_path.read_bytes()
+        i = buf.find(b"STSQ")
+        assert i >= 0, "no STSQ section"
+        # STSQ is followed by SDCU then END; measure to whichever comes first so the
+        # STSQ size is isolated from the (separately-bounded) SDCU section.
+        j = buf.find(b"SDCU", i)
+        if j < 0:
+            j = buf.find(b"END\x00", i)
+        return (j if j >= 0 else len(buf)) - i
+
+    def trace_n(prefix, n):
+        subprocess.run(
+            [_sidtrace_bin(), str(fixture_sid), "1", str(n), str(prefix)],
+            check=True,
+        )
+        return Path(f"{prefix}.distill.bin")
+
+    # both windows exceed M=512 so the per-cell sample count is saturated and the
+    # fixture's single state cell is discovered immediately -> identical size.
+    a = trace_n(tmp_path / "w800", 800)
+    b = trace_n(tmp_path / "w1600", 1600)
+    sw_a = load_sidwr(Path(str(a).replace(".distill.bin", ".sidwr.bin")))
+    sw_b = load_sidwr(Path(str(b).replace(".distill.bin", ".sidwr.bin")))
+    assert sw_b.size > sw_a.size, "longer capture should have more SID writes"
+    assert stsq_nbytes(a) == stsq_nbytes(b), (
+        "STATESEQ size grew with capture length -- it must be O(state cells * M)"
+    )
+    # and the per-cell sample count is capped at M=512.
+    d = parse_sdst(b)
+    assert all(e["n_samples"] <= 512 for e in d["stateseq"])
+
+
+def test_sdcu_present_for_state_cell_update(trace):
+    """SDCU (design 2.2/2.3) carries the in-call UPDATE DAG of each state cell -- how
+    the cell was recomputed, the data the SID-write slice could not give (the cell is
+    a leaf there). The fixture's RAM counter is INC'd every play-call; its SDCU entry
+    must be the self-feedback accumulator recurrence s' = s+1: an INC op with the cell
+    itself as a (state) leaf. Keyed by the cell ADDRESS, so O(state cells)."""
+    d = parse_sdst(trace["distill"])
+    assert d["sdcu"], "no SDCU update DAGs emitted"
+    # every SDCU cell is a SIDDF-flagged state cell (the emit filter)
+    siddf_state = {
+        a for e in d["siddf"] for k, a, _v in e["leaves"] if k == LK_STATE_CELL
+    }
+    sdcu_addrs = {e["pc"] for e in d["sdcu"]}   # pc field holds the cell addr
+    assert sdcu_addrs <= siddf_state, (
+        f"SDCU cells {sorted(sdcu_addrs)} must be SIDDF state cells "
+        f"{sorted(siddf_state)}"
+    )
+    # the counter cell's update DAG is the s'=s+1 accumulator: INC + self-leaf.
+    counter = next(iter(d["sdcu"]))
+    assert ALU_INC in counter["op_seq"], (
+        f"counter update DAG is not an INC accumulator: ops={counter['op_seq']}"
+    )
+    assert any(a == counter["pc"] for _k, a, _v in counter["leaves"]), (
+        "the accumulator's own cell must be a self-feedback leaf of its update"
+    )
+
+
+def test_sdcu_carries_midcall_valseq(trace):
+    """Stage 3b: every SDCU entry carries the cell's MID-CALL value sequence (the
+    value its in-call UPDATE wrote, sampled at the update site -- NOT at the call
+    boundary). This is the genuine generator state stream the host feeds to
+    Berlekamp-Massey for the LFSR-vs-not verdict (a fast SMC cell's call-boundary
+    STATESEQ is a constant residue and useless for that). It must be present and
+    bounded; for the fixture's INC counter it is the running counter value."""
+    d = parse_sdst(trace["distill"])
+    assert d["sdcu"], "no SDCU update DAGs emitted"
+    for e in d["sdcu"]:
+        vs = e.get("val_seq", [])
+        assert isinstance(vs, list)
+        assert len(vs) <= 512, "SDCU value sequence exceeds the bound"
+    # at least one SDCU cell carries a non-trivial value sequence (the counter)
+    assert any(len(e.get("val_seq", [])) >= 2 for e in d["sdcu"]), (
+        "no SDCU cell carried a mid-call value sequence"
+    )
+
+
+def test_sddf_has_no_valseq(trace):
+    """The mid-call value sequence is an SDCU-only field; SDDF (the SID-write
+    slices) writes nValSeq=0 (the field exists only for a uniform entry shape so one
+    reader parses both sections)."""
+    d = parse_sdst(trace["distill"])
+    for e in d["siddf"]:
+        assert not e.get("val_seq", []), "SDDF must not carry a value sequence"
+
+
+def test_sdcu_flat_vs_capture_length(tmp_path, fixture_sid):
+    """SDCU is O(state cells) + a BOUNDED per-cell mid-call value sequence, NOT
+    O(frames): the update DAG of a cell (op_seq + leaves + strided interval) is
+    invariant across frames, and the mid-call value sequence is capped at
+    SDCU_VALSEQ_M (512) samples per cell. So (a) the STRUCTURAL part of each SDCU
+    entry is byte-identical across capture lengths and (b) the value sequence
+    SATURATES at the cap and stops growing -- it is flat, not length-proportional.
+
+    (Stage 3b: the value sequence is the genuine mid-call generator state stream the
+    host feeds to Berlekamp-Massey; it is bounded so the artifact stays flat.)"""
+
+    SDCU_VALSEQ_M = 512  # mirror SiddfSummary::SDCU_VALSEQ_M
+
+    def sdcu_entries(distill_path):
+        d = parse_sdst(distill_path)
+        # key by cell addr; record (structural-signature, valseq-len)
+        out = {}
+        for e in d["sdcu"]:
+            struct_sig = (
+                tuple(e["op_seq"]), tuple(e["leaves"]), e["has_stride"],
+                e["stride_base"], e["stride_idx_min"], e["stride_idx_max"],
+            )
+            out[e["pc"]] = (struct_sig, len(e.get("val_seq", [])))
+        return out
+
+    def trace_n(prefix, n):
+        subprocess.run(
+            [_sidtrace_bin(), str(fixture_sid), "1", str(n), str(prefix)],
+            check=True,
+        )
+        return Path(f"{prefix}.distill.bin")
+
+    # two windows both well PAST value-sequence saturation (the per-cell cap is
+    # reached early), so the value-sequence length is identical too.
+    a = sdcu_entries(trace_n(tmp_path / "s_a", 1200))
+    b = sdcu_entries(trace_n(tmp_path / "s_b", 2400))
+    common = set(a) & set(b)
+    assert common, "no common SDCU cells across capture lengths"
+    for addr in common:
+        # STRUCTURAL part is invariant (the update DAG is the recurrence)
+        assert a[addr][0] == b[addr][0], (
+            f"SDCU update DAG of ${addr:04x} changed with capture length"
+        )
+        # value sequence is bounded by the cap and (past saturation) does not grow
+        assert a[addr][1] <= SDCU_VALSEQ_M and b[addr][1] <= SDCU_VALSEQ_M
+        assert a[addr][1] == b[addr][1], (
+            f"SDCU value sequence of ${addr:04x} grew with capture length past "
+            f"saturation -- must be bounded/flat: {a[addr][1]} vs {b[addr][1]}"
+        )
 
 
 def test_per_frame_write_cadence(trace):
