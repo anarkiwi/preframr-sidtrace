@@ -189,6 +189,13 @@ def parse_sdst(path):
                 off += 2
                 ops = list(struct.unpack_from(f"<{nops}B", buf, off)) if nops else []
                 off += nops
+                # mid-call value sequence (SDCU's genuine generator state stream;
+                # empty for SDDF). The BM input for the LFSR-vs-not verdict.
+                (nval,) = struct.unpack_from("<H", buf, off)
+                off += 2
+                valseq = (list(struct.unpack_from(f"<{nval}B", buf, off))
+                          if nval else [])
+                off += nval
                 dest.append(
                     {
                         "pc": pc, "reg": reg, "flags": flags, "count": count,
@@ -198,6 +205,7 @@ def parse_sdst(path):
                         "stride_base": sbase, "stride_step": sstep,
                         "stride_idx_min": simin, "stride_idx_max": simax,
                         "slice_pcs": pcs, "leaves": leaves, "op_seq": ops,
+                        "val_seq": valseq,
                     }
                 )
         elif tag == b"STSQ":

@@ -169,7 +169,7 @@ new file mode 100644
 index 00000000..11ca6128
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,1294 @@
+@@ -0,0 +1,1310 @@
 +/*
 + * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
 + * Not part of upstream libsidplayfp. Scratch use only.
@@ -410,6 +410,15 @@ index 00000000..11ca6128
 +    uint8_t  strideIdxMin = 0xff;
 +    uint8_t  strideIdxMax = 0;
 +    bool     anyOutOfWindow = false;
++    // MID-CALL value sequence (SDCU only): the bounded sequence of values the
++    // cell's in-call UPDATE actually wrote, sampled at the update site (NOT at the
++    // call boundary). A fast mid-call SMC cell (A Mind's $14 LFSR) is consumed and
++    // overwritten WITHIN a play-call, so its call-boundary STATESEQ sample is a
++    // constant (the carried-out residue) and tells the host nothing. The value the
++    // update writes IS the generator's state sequence -- the input Berlekamp-Massey
++    // needs to decide LFSR-vs-not. Bounded (SDCU_VALSEQ_M entries), flat vs frames.
++    static constexpr uint32_t SDCU_VALSEQ_M = 512;
++    std::vector<uint8_t> valSeq;        // first SDCU_VALSEQ_M update-written values
 +};
 +
 +class MemBusTrace
@@ -1137,6 +1146,10 @@ index 00000000..11ca6128
 +        SiddfSummary &s = sdcu[cellAddr];
 +        s.count++;
 +        addPc(s, pc);
++        // mid-call value sequence: the cell's value AFTER this RMW retired (the
++        // self-feedback recurrence's next state); bounded, flat vs frames.
++        if (s.valSeq.size() < SiddfSummary::SDCU_VALSEQ_M && ramFn)
++            s.valSeq.push_back(ramFn(ramCtx, cellAddr));
 +        if (s.count > 1) return;             // op + leaf are invariant; record once
 +        if (op != ALU_NONE && s.opSeq.size() < 32) s.opSeq.push_back(op);
 +        addLeaf(s, LK_RAM_READ, cellAddr, ramFn ? ramFn(ramCtx, cellAddr) : 0);
@@ -1150,6 +1163,9 @@ index 00000000..11ca6128
 +        if (!s.valSeen) { s.valFirst = v; s.valSeen = true; }
 +        if (v < s.valLo) s.valLo = v;
 +        if (v > s.valHi) s.valHi = v;
++        // mid-call value sequence (the genuine generator state stream the host
++        // feeds to Berlekamp-Massey; bounded, flat vs frames)
++        if (s.valSeq.size() < SiddfSummary::SDCU_VALSEQ_M) s.valSeq.push_back(v);
 +        s.count++;
 +        addPc(s, st.pc);
 +        if (s.count > 32) return;             // shape invariant; refine cheaply only

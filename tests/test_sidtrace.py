@@ -357,16 +357,58 @@ def test_sdcu_present_for_state_cell_update(trace):
     )
 
 
-def test_sdcu_flat_vs_capture_length(tmp_path, fixture_sid):
-    """SDCU is O(state cells), NOT O(frames): the update DAG of a cell is invariant
-    across frames, so the section size does not grow with the capture window."""
+def test_sdcu_carries_midcall_valseq(trace):
+    """Stage 3b: every SDCU entry carries the cell's MID-CALL value sequence (the
+    value its in-call UPDATE wrote, sampled at the update site -- NOT at the call
+    boundary). This is the genuine generator state stream the host feeds to
+    Berlekamp-Massey for the LFSR-vs-not verdict (a fast SMC cell's call-boundary
+    STATESEQ is a constant residue and useless for that). It must be present and
+    bounded; for the fixture's INC counter it is the running counter value."""
+    d = parse_sdst(trace["distill"])
+    assert d["sdcu"], "no SDCU update DAGs emitted"
+    for e in d["sdcu"]:
+        vs = e.get("val_seq", [])
+        assert isinstance(vs, list)
+        assert len(vs) <= 512, "SDCU value sequence exceeds the bound"
+    # at least one SDCU cell carries a non-trivial value sequence (the counter)
+    assert any(len(e.get("val_seq", [])) >= 2 for e in d["sdcu"]), (
+        "no SDCU cell carried a mid-call value sequence"
+    )
 
-    def sdcu_nbytes(distill_path):
-        buf = distill_path.read_bytes()
-        i = buf.find(b"SDCU")
-        assert i >= 0, "no SDCU section"
-        j = buf.find(b"END\x00", i)
-        return (j if j >= 0 else len(buf)) - i
+
+def test_sddf_has_no_valseq(trace):
+    """The mid-call value sequence is an SDCU-only field; SDDF (the SID-write
+    slices) writes nValSeq=0 (the field exists only for a uniform entry shape so one
+    reader parses both sections)."""
+    d = parse_sdst(trace["distill"])
+    for e in d["siddf"]:
+        assert not e.get("val_seq", []), "SDDF must not carry a value sequence"
+
+
+def test_sdcu_flat_vs_capture_length(tmp_path, fixture_sid):
+    """SDCU is O(state cells) + a BOUNDED per-cell mid-call value sequence, NOT
+    O(frames): the update DAG of a cell (op_seq + leaves + strided interval) is
+    invariant across frames, and the mid-call value sequence is capped at
+    SDCU_VALSEQ_M (512) samples per cell. So (a) the STRUCTURAL part of each SDCU
+    entry is byte-identical across capture lengths and (b) the value sequence
+    SATURATES at the cap and stops growing -- it is flat, not length-proportional.
+
+    (Stage 3b: the value sequence is the genuine mid-call generator state stream the
+    host feeds to Berlekamp-Massey; it is bounded so the artifact stays flat.)"""
+
+    SDCU_VALSEQ_M = 512  # mirror SiddfSummary::SDCU_VALSEQ_M
+
+    def sdcu_entries(distill_path):
+        d = parse_sdst(distill_path)
+        # key by cell addr; record (structural-signature, valseq-len)
+        out = {}
+        for e in d["sdcu"]:
+            struct_sig = (
+                tuple(e["op_seq"]), tuple(e["leaves"]), e["has_stride"],
+                e["stride_base"], e["stride_idx_min"], e["stride_idx_max"],
+            )
+            out[e["pc"]] = (struct_sig, len(e.get("val_seq", [])))
+        return out
 
     def trace_n(prefix, n):
         subprocess.run(
@@ -375,11 +417,23 @@ def test_sdcu_flat_vs_capture_length(tmp_path, fixture_sid):
         )
         return Path(f"{prefix}.distill.bin")
 
-    short = trace_n(tmp_path / "s_short", 30)
-    long = trace_n(tmp_path / "s_long", 600)
-    assert sdcu_nbytes(short) == sdcu_nbytes(long), (
-        "SDCU size grew with capture length -- it must be O(state cells), not O(frames)"
-    )
+    # two windows both well PAST value-sequence saturation (the per-cell cap is
+    # reached early), so the value-sequence length is identical too.
+    a = sdcu_entries(trace_n(tmp_path / "s_a", 1200))
+    b = sdcu_entries(trace_n(tmp_path / "s_b", 2400))
+    common = set(a) & set(b)
+    assert common, "no common SDCU cells across capture lengths"
+    for addr in common:
+        # STRUCTURAL part is invariant (the update DAG is the recurrence)
+        assert a[addr][0] == b[addr][0], (
+            f"SDCU update DAG of ${addr:04x} changed with capture length"
+        )
+        # value sequence is bounded by the cap and (past saturation) does not grow
+        assert a[addr][1] <= SDCU_VALSEQ_M and b[addr][1] <= SDCU_VALSEQ_M
+        assert a[addr][1] == b[addr][1], (
+            f"SDCU value sequence of ${addr:04x} grew with capture length past "
+            f"saturation -- must be bounded/flat: {a[addr][1]} vs {b[addr][1]}"
+        )
 
 
 def test_per_frame_write_cadence(trace):

@@ -110,7 +110,9 @@ static std::vector<uint8_t> readFile(const char *path)
  *        strideBase u16, strideStep i32, strideIdxMin u8, strideIdxMax u8,
  *        nPcs u16,   then nPcs * (pc u16),
  *        nLeaves u16, then nLeaves * (kind u8, _pad u8, addr u16, value u8, _pad u8),
- *        nOps u16,   then nOps * (op u8).
+ *        nOps u16,   then nOps * (op u8),
+ *        nValSeq u16, then nValSeq * (value u8).  (SDDF writes nValSeq=0; the field
+ *        carries the mid-call value sequence for SDCU -- see below.)
  *
  *   SECTION "STSQ" (bounded inter-frame STATE-CELL sample sequence; design 3.2).
  *     For each cell SIDDF flagged as a state leaf, a bounded sequence of its
@@ -139,7 +141,12 @@ static std::vector<uint8_t> readFile(const char *path)
  *     STORE (or in-place INC/DEC/shift RMW) that DEFINED the cell earlier in the
  *     SAME play-call -- the update DAG cell' = f(cell, C, K, immediates) the host
  *     generalizes into U. Only cells SIDDF flagged as state leaves are emitted.
- *     O(state cells), flat vs frame count.  Tag char[4] "SDCU".
+ *     O(state cells), flat vs frame count.  Tag char[4] "SDCU".  The trailing
+ *     nValSeq field carries the cell's MID-CALL value sequence (the value the
+ *     update wrote, sampled at the update site, NOT at the call boundary): the
+ *     genuine generator state stream the host feeds to Berlekamp-Massey for the
+ *     LFSR-vs-not verdict (a fast SMC cell's call-boundary STATESEQ is a constant
+ *     residue and useless for this).  Bounded SDCU_VALSEQ_M, flat vs frames.
  *
  *   SECTION "END\0" terminates.
  *
@@ -341,6 +348,10 @@ static long emit_distill(const char *path, MemBusTrace &tr,
             }
             wr_u16(f, (uint16_t)s.opSeq.size());
             for (uint8_t op : s.opSeq) wr_u8(f, op);
+            // mid-call value sequence (SDDF carries none; field present for a
+            // uniform SDDF/SDCU entry shape so one reader parses both).
+            wr_u16(f, (uint16_t)s.valSeq.size());
+            for (uint8_t v : s.valSeq) wr_u8(f, v);
         }
     }
 
@@ -422,6 +433,12 @@ static long emit_distill(const char *path, MemBusTrace &tr,
             }
             wr_u16(f, (uint16_t)s.opSeq.size());
             for (uint8_t op : s.opSeq) wr_u8(f, op);
+            // mid-call value sequence: the genuine generator state stream sampled
+            // at the cell's UPDATE site (NOT at the call boundary). This is what the
+            // host feeds to Berlekamp-Massey for the LFSR-vs-not verdict (design
+            // 2.5/2.7). Bounded SDCU_VALSEQ_M, flat vs frame count.
+            wr_u16(f, (uint16_t)s.valSeq.size());
+            for (uint8_t v : s.valSeq) wr_u8(f, v);
             nent++;
         }
         long end = ftell(f);
