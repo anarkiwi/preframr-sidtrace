@@ -166,10 +166,10 @@ index 691ab7f8..e82f4a3b 100644
          if (addr >= 0x0400 && addr <= 0x07ff)
 diff --git a/src/c64/membus_trace.h b/src/c64/membus_trace.h
 new file mode 100644
-index 00000000..35e3d2cc
+index 00000000..a1b23fbd
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,959 @@
+@@ -0,0 +1,1106 @@
 +/*
 + * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
 + * Not part of upstream libsidplayfp. Scratch use only.
@@ -238,6 +238,7 @@ index 00000000..35e3d2cc
 +#define MEMBUS_TRACE_H
 +
 +#include <cstdint>
++#include <cstdio>
 +#include <cstring>
 +#include <map>
 +#include <vector>
@@ -338,6 +339,38 @@ index 00000000..35e3d2cc
 +    uint8_t  value = 0;                 // representative value (immediate value, or last seen)
 +};
 +
++// --- STATESEQ (bounded inter-frame state-cell sample sequence) types -------
++// To run Stage C (Daikon-style inter-frame relation + Berlekamp-Massey) the host
++// needs the SEQUENCE of each candidate state cell across play-calls -- but only
++// for the handful of cells the SIDDF slices flag as state, and bounded to the
++// first M samples per cell (>= 2L for any recoverable linear recurrence; enough
++// for Daikon statistical justification). Per cell we also keep a cheap
++// in-emulator running check that the recurrence implied by the first M samples
++// continues to hold to the end of the capture (holdsToEnd), so the host can
++// trust a short window without re-deriving over the whole run. O(state cells *
++// M), flat vs run length. (design 3.2)
++struct StateSeqCell
++{
++    static constexpr uint32_t SS_M = 512;   // bounded sample count per cell
++    uint16_t samples[SS_M];                 // first SS_M per-play-call samples (u16-wide so a 16-bit pair can be stored if ever needed; cells are u8 in practice)
++    uint32_t nSamples = 0;                  // number of samples actually taken
++    uint32_t totalFrames = 0;              // play-calls seen for this cell
++    uint32_t firstSeenFrame = 0;            // global play-call index of sample[0]
++    bool     wide = false;                  // true if any sample exceeded 0xff
++    // holds_to_end check: once SS_M samples are in, the host-equivalent in-emulator
++    // fold tests whether the simplest single-template recurrence the window
++    // implies (s'=s+c constant first difference, modulo the cell width) keeps
++    // holding. We track it conservatively: the first-difference of the prefix must
++    // remain constant (mod 256) for the running prediction to hold. If the cell is
++    // not a constant-stride accumulator the prefix difference is not constant and
++    // holdsToEnd is reported false (the host then does the full fit from samples).
++    bool     diffKnown = false;
++    int32_t  firstDiff = 0;                 // (samples[1]-samples[0]) mod 256 candidate
++    bool     constDiff = true;              // first-difference constant so far (mod 256)
++    uint16_t lastSample = 0;
++    bool     haveLast = false;
++};
++
 +// One retired-instruction record in the ring buffer. Assembled from the bus
 +// event stream between opcode-fetch boundaries -- addressing-mode-agnostic.
 +struct RetiredInstr
@@ -424,6 +457,26 @@ index 00000000..35e3d2cc
 +
 +    // SIDDF: per-(PC,reg) data-flow summary, same key space as sidWrites.
 +    std::map<uint32_t, SiddfSummary> siddf;
++
++    // STATESEQ: per-candidate-state-cell inter-frame sample sequence (design 3.2).
++    // Keyed by RAM address. Populated once per play-call (frame) for every address
++    // that, at sampling time, satisfies the state-cell predicate (WRITE_PLAY &
++    // READ_PLAY in RAM, or EXEC_PLAY & WRITE_PLAY -- the SMC-correct state class).
++    // At emit time the section is filtered to the cells SIDDF actually flagged as
++    // state leaves, keeping it to the handful of real state cells. Bounded:
++    // <=STATESEQ_CAP cells * SS_M samples, flat vs run length.
++    static constexpr uint32_t STATESEQ_CAP = 96;
++    std::map<uint16_t, StateSeqCell> stateSeq;
++    // Frame (play-call) boundary detection: a play-call's SID writes arrive in a
++    // tight burst (~25 writes within a few hundred cycles) separated by a large
++    // inter-call gap (~16k-20k cycles). The first SID write after such a gap marks
++    // a new play-call; that is when we sample the state cells (each cell then holds
++    // the value it carried INTO this call -- the inter-frame state). Threshold is
++    // well below a frame and well above an intra-burst gap.
++    static constexpr int64_t FRAME_GAP_CYCLES = 2000;
++    int64_t  lastSidWriteCycle = -1;
++    bool     anyFrameStarted = false;
++    uint32_t frameNo = 0;          // global play-call index (sampling boundaries)
 +
 +    // --- ring buffer of retired instructions (bounded backward-slice window) ---
 +    RetiredInstr ring[RING_CAP];
@@ -612,6 +665,10 @@ index 00000000..35e3d2cc
 +        idxReads.clear();
 +        sidStream.clear();
 +        siddf.clear();
++        stateSeq.clear();
++        lastSidWriteCycle = -1;
++        anyFrameStarted = false;
++        frameNo = 0;
 +        ringHead = 0;
 +        ringFill = 0;
 +        ringSeq = 0;
@@ -628,6 +685,20 @@ index 00000000..35e3d2cc
 +    {
 +        if (firstSidWriteCycle < 0 && phase == PHASE_PLAY)
 +            firstSidWriteCycle = now();
++        // Play-call (frame) boundary: the first SID write of a new burst. Sample
++        // the candidate state cells HERE -- each cell still holds the value it
++        // carried INTO this play-call (the inter-frame state Stage C fits).
++        if (phase == PHASE_PLAY)
++        {
++            const int64_t t = now();
++            if (!anyFrameStarted ||
++                (lastSidWriteCycle >= 0 && (t - lastSidWriteCycle) > FRAME_GAP_CYCLES))
++            {
++                sampleStateCells();
++                anyFrameStarted = true;
++            }
++            lastSidWriteCycle = t;
++        }
 +        const uint8_t reg = (uint8_t)(addr & 0x1f);
 +        SidWrSummary &s = sidWrites[((uint32_t)pc() << 5) | reg];
 +        s.count++;
@@ -866,6 +937,68 @@ index 00000000..35e3d2cc
 +        // song-data table byte (K).
 +        if (readPlay && !execAny) return LK_RAM_READ;
 +        return LK_RAM_READ;
++    }
++
++    // Sample the SIDDF-flagged state cells at a play-call boundary (design 3.2).
++    // We target EXACTLY the cells the live SIDDF slices have already surfaced as
++    // state leaves -- not every write/read RAM cell (a busy player touches
++    // thousands of scratch cells that are written+read during play but carry no
++    // axis state). The SIDDF slicer runs per SID write, so by the time the first
++    // play-call has issued its SID-write burst the relevant state leaves are
++    // populated; a cell that first appears as a state leaf later is picked up at
++    // its first subsequent frame boundary. Bounded: <= STATESEQ_CAP distinct cells
++    // (the slices surface only a handful), SS_M samples each, flat vs run length.
++    inline void sampleStateCells()
++    {
++        if (!ramFn) return;
++        auto sampleCell = [&](uint16_t a) {
++            auto it = stateSeq.find(a);
++            if (it == stateSeq.end())
++            {
++                if (stateSeq.size() >= STATESEQ_CAP) return;   // bounded
++                it = stateSeq.emplace(a, StateSeqCell{}).first;
++            }
++            StateSeqCell &c = it->second;
++            if (c.totalFrames == 0) c.firstSeenFrame = frameNo;
++            const uint8_t v = ramFn(ramCtx, a);
++            c.totalFrames++;
++            // running constant-first-difference (mod 256) holds-to-end check
++            if (c.haveLast)
++            {
++                const int32_t d = ((int32_t)v - (int32_t)c.lastSample) & 0xff;
++                if (!c.diffKnown) { c.firstDiff = d; c.diffKnown = true; }
++                else if (d != c.firstDiff) c.constDiff = false;
++            }
++            c.lastSample = v;
++            c.haveLast = true;
++            if (c.nSamples < StateSeqCell::SS_M)
++                c.samples[c.nSamples++] = v;
++        };
++        // Sample the memory-leaf addresses the live SIDDF slices have surfaced
++        // that ALSO satisfy the state-cell access predicate (the same predicate
++        // classifyLeaf/finalizeLeaves use for LK_STATE_CELL). During the run leaf
++        // kinds are still provisional (reclassified to LK_STATE_CELL only at
++        // finalizeLeaves), so we cannot filter on l.kind here; instead we restrict
++        // to the SIDDF leaf addresses (a handful -- the slices already isolated the
++        // generator's inputs) and apply the access-type predicate directly. This
++        // targets exactly the cells that will be state cells, without scanning the
++        // thousands of scratch RAM cells a busy player also writes+reads. The emit
++        // filter (isSiddfStateCell, after finalizeLeaves) drops any that did not
++        // end up classified as state. Cheap: tens of sites x tens of leaves.
++        for (const auto &kv : siddf)
++            for (const auto &l : kv.second.leaves)
++            {
++                const uint16_t a = l.addr;
++                if (a == 0 || a >= 0xd000) continue;        // skip immediates / IO
++                const uint8_t b = acc[a];
++                const bool execAny   = b & (ACC_EXEC_INIT | ACC_EXEC_PLAY);
++                const bool writePlay = b & ACC_WRITE_PLAY;
++                const bool readPlay  = b & ACC_READ_PLAY;
++                const bool isState = (execAny && writePlay) ||
++                                     (writePlay && readPlay);
++                if (isState) sampleCell(a);
++            }
++        frameNo++;
 +    }
 +
 +    inline RetiredInstr &ringAt(uint32_t i) { return ring[i % RING_CAP]; }
@@ -1124,6 +1257,20 @@ index 00000000..35e3d2cc
 +                if (l.kind == LK_RAM_READ)
 +                    l.kind = classifyLeaf(l.addr);
 +    }
++
++    // Is `addr` flagged as a state cell by some SIDDF site (after finalizeLeaves)?
++    // Used to filter STATESEQ down to the cells the host actually needs to fit a
++    // recurrence for -- the handful the slices surfaced -- keeping the section
++    // small. Call AFTER finalizeLeaves().
++    bool isSiddfStateCell(uint16_t addr) const
++    {
++        for (const auto &kv : siddf)
++            for (const auto &l : kv.second.leaves)
++                if (l.kind == LK_STATE_CELL && l.addr == addr)
++                    return true;
++        return false;
++    }
++
 +};
 +
 +} // namespace libsidplayfp

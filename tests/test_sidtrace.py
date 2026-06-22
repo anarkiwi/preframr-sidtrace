@@ -241,7 +241,11 @@ def test_siddf_flat_vs_capture_length(tmp_path, fixture_sid):
         buf = distill_path.read_bytes()
         i = buf.find(b"SDDF")
         assert i >= 0
-        j = buf.find(b"END\x00", i)
+        # SDDF is followed by STSQ then END; measure to whichever comes first so
+        # the SIDDF size is isolated from the (separately-bounded) STSQ section.
+        j = buf.find(b"STSQ", i)
+        if j < 0:
+            j = buf.find(b"END\x00", i)
         return (j if j >= 0 else len(buf)) - i
 
     def trace_n(prefix, n):
@@ -259,6 +263,66 @@ def test_siddf_flat_vs_capture_length(tmp_path, fixture_sid):
     assert siddf_nbytes(short) == siddf_nbytes(long), (
         "SIDDF size grew with capture length -- it must be O(code sites), not O(frames)"
     )
+
+
+def test_stateseq_present_for_flagged_state_cells(trace):
+    """STATESEQ (design 3.2) carries an inter-frame sample sequence for every cell
+    SIDDF flagged as a state leaf. The fixture's freq-lo ($D400) is fed by a RAM
+    counter INC'd every play-call; that counter must appear in STATESEQ with a
+    monotone +1 sample sequence (and holds_to_end True -- a constant-stride
+    accumulator)."""
+    d = parse_sdst(trace["distill"])
+    assert d["stateseq"], "no STATESEQ sample sequences emitted"
+    # the set of STATESEQ cells must be exactly the SIDDF-flagged state cells
+    siddf_state = {
+        a for e in d["siddf"] for k, a, _v in e["leaves"] if k == LK_STATE_CELL
+    }
+    stseq_addrs = {e["addr"] for e in d["stateseq"]}
+    assert stseq_addrs == siddf_state, (
+        f"STATESEQ cells {sorted(stseq_addrs)} != SIDDF state cells "
+        f"{sorted(siddf_state)}"
+    )
+    # the counter cell's sequence is a clean +1 accumulator -> holds_to_end.
+    counter = next(e for e in d["stateseq"] if e["holds_to_end"])
+    s = counter["samples"]
+    assert len(s) >= 8
+    diffs = {(s[i + 1] - s[i]) & 0xFF for i in range(len(s) - 1)}
+    assert diffs == {1}, f"counter STATESEQ is not a +1 accumulator: diffs={diffs}"
+
+
+def test_stateseq_bounded_and_flat_vs_capture_length(tmp_path, fixture_sid):
+    """STATESEQ stays bounded (capped at M samples/cell) and does NOT grow once
+    the capture window exceeds M and all state cells are discovered: the section is
+    O(state cells * M), not O(frames). Trace two windows both >> M and require an
+    identical STATESEQ byte count."""
+
+    def stsq_nbytes(distill_path):
+        buf = distill_path.read_bytes()
+        i = buf.find(b"STSQ")
+        assert i >= 0, "no STSQ section"
+        j = buf.find(b"END\x00", i)
+        return (j if j >= 0 else len(buf)) - i
+
+    def trace_n(prefix, n):
+        subprocess.run(
+            [_sidtrace_bin(), str(fixture_sid), "1", str(n), str(prefix)],
+            check=True,
+        )
+        return Path(f"{prefix}.distill.bin")
+
+    # both windows exceed M=512 so the per-cell sample count is saturated and the
+    # fixture's single state cell is discovered immediately -> identical size.
+    a = trace_n(tmp_path / "w800", 800)
+    b = trace_n(tmp_path / "w1600", 1600)
+    sw_a = load_sidwr(Path(str(a).replace(".distill.bin", ".sidwr.bin")))
+    sw_b = load_sidwr(Path(str(b).replace(".distill.bin", ".sidwr.bin")))
+    assert sw_b.size > sw_a.size, "longer capture should have more SID writes"
+    assert stsq_nbytes(a) == stsq_nbytes(b), (
+        "STATESEQ size grew with capture length -- it must be O(state cells * M)"
+    )
+    # and the per-cell sample count is capped at M=512.
+    d = parse_sdst(b)
+    assert all(e["n_samples"] <= 512 for e in d["stateseq"])
 
 
 def test_per_frame_write_cadence(trace):

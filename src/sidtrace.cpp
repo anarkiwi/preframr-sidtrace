@@ -106,6 +106,25 @@ static std::vector<uint8_t> readFile(const char *path)
  *        nLeaves u16, then nLeaves * (kind u8, _pad u8, addr u16, value u8, _pad u8),
  *        nOps u16,   then nOps * (op u8).
  *
+ *   SECTION "STSQ" (bounded inter-frame STATE-CELL sample sequence; design 3.2).
+ *     For each cell SIDDF flagged as a state leaf, a bounded sequence of its
+ *     value across play-calls (frames): the inter-frame state samples Stage C
+ *     (Daikon-style recurrence inference / Berlekamp-Massey) fits.  Keyed by RAM
+ *     address; O(state cells * M), FLAT vs frame count (M is capped).  Tag is 4
+ *     bytes "STSQ".  Layout: tag; nentries u32; then per entry:
+ *        addr u16, flags u8 (bit0=holdsToEnd, bit1=wide), _pad u8,
+ *        totalFrames u32, firstSeenFrame u32, nSamples u16,
+ *        then nSamples * (sample u8).  (Cells are byte-wide in practice; the
+ *        wide flag is reserved for a future 16-bit pair and is never set here.)
+ *     firstSeenFrame: global play-call index of sample[0] (a cell that becomes a
+ *     SIDDF state leaf mid-run starts sampling later; the host aligns to the
+ *     master frame grid with this).
+ *     holdsToEnd: the constant-stride (first-difference, mod byte width)
+ *     recurrence implied by the sample prefix kept holding to the end of the
+ *     capture (a cheap in-emulator running check); the host can trust a short
+ *     window without re-deriving over the whole run.  wide: a sample exceeded
+ *     0xff (a 16-bit cell pair); samples are u8 in practice.
+ *
  *   SECTION "END\0" terminates.
  *
  * Returns the artifact size in bytes.
@@ -295,6 +314,37 @@ static long emit_distill(const char *path, MemBusTrace &tr,
             wr_u16(f, (uint16_t)s.opSeq.size());
             for (uint8_t op : s.opSeq) wr_u8(f, op);
         }
+    }
+
+    // STSQ: bounded inter-frame state-cell sample sequences, filtered to the
+    // cells SIDDF flagged as state leaves (design 3.2). O(state cells * M), flat.
+    {
+        fwrite("STSQ", 1, 4, f);
+        long nentPos = ftell(f);
+        wr_u32(f, 0);                          // nentries, backpatched
+        uint32_t nent = 0;
+        for (const auto &kv : tr.stateSeq)
+        {
+            const uint16_t addr = kv.first;
+            if (!tr.isSiddfStateCell(addr)) continue;   // only real state cells
+            const libsidplayfp::StateSeqCell &c = kv.second;
+            uint8_t flags = 0;
+            if (c.constDiff)  flags |= 0x01;   // holds_to_end
+            if (c.wide)       flags |= 0x02;
+            wr_u16(f, addr);
+            wr_u8(f, flags);
+            wr_u8(f, 0);
+            wr_u32(f, (uint32_t)c.totalFrames);
+            wr_u32(f, (uint32_t)c.firstSeenFrame);
+            wr_u16(f, (uint16_t)c.nSamples);
+            for (uint32_t i = 0; i < c.nSamples; ++i)
+                wr_u8(f, (uint8_t)c.samples[i]);
+            nent++;
+        }
+        long end = ftell(f);
+        fseek(f, nentPos, SEEK_SET);
+        wr_u32(f, nent);
+        fseek(f, end, SEEK_SET);
     }
 
     fwrite("END\0", 1, 4, f);

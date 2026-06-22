@@ -50,6 +50,10 @@ _SIDDF_HEAD = struct.Struct("<HBBIBBBxHiBB")
 #  strideBase u16, strideStep i32, strideIdxMin u8, strideIdxMax u8
 _SIDDF_LEAF = struct.Struct("<BxHBx")  # kind u8, pad, addr u16, value u8, pad
 
+# STSQ (inter-frame state-cell sample sequence, design 3.2). Variable-length.
+#  addr u16, flags u8, pad, totalFrames u32, firstSeenFrame u32, nSamples u16
+_STSQ_HEAD = struct.Struct("<HBxIIH")
+
 # Leaf kinds (mirror membus_trace.h LeafKind).
 LK_IMMEDIATE = 0
 LK_RAM_READ = 1
@@ -103,6 +107,7 @@ def parse_sdst(path):
     sid_writes = []
     idx_reads = []
     siddf = []
+    stateseq = []
     while off < len(buf):
         tag = buf[off : off + 4]
         off += 4
@@ -182,6 +187,27 @@ def parse_sdst(path):
                         "slice_pcs": pcs, "leaves": leaves, "op_seq": ops,
                     }
                 )
+        elif tag == b"STSQ":
+            (nent,) = struct.unpack_from("<I", buf, off)
+            off += 4
+            for _ in range(nent):
+                addr, flags, total_frames, first_seen, nsamp = _STSQ_HEAD.unpack_from(
+                    buf, off
+                )
+                off += _STSQ_HEAD.size
+                samples = list(struct.unpack_from(f"<{nsamp}B", buf, off))
+                off += nsamp
+                stateseq.append(
+                    {
+                        "addr": addr,
+                        "holds_to_end": bool(flags & 1),
+                        "wide": bool(flags & 2),
+                        "total_frames": total_frames,
+                        "first_seen_frame": first_seen,
+                        "n_samples": nsamp,
+                        "samples": samples,
+                    }
+                )
         else:
             raise ValueError(f"unknown SDST section {tag!r}")
 
@@ -200,6 +226,7 @@ def parse_sdst(path):
         "sid_writes": sid_writes,
         "idx_reads": idx_reads,
         "siddf": siddf,
+        "stateseq": stateseq,
     }
 
 
