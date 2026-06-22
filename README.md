@@ -51,8 +51,15 @@ sections terminated by `"END\0"`:
 | `SNAP`  | post-init RAM snapshot for the SONG-DATA region only: `(addr u16, len u16, bytes[len])` runs — the verbatim song bytes, captured once at the init→play boundary |
 | `SIDW`  | PC-tagged SID-write summary: `(pc u16, reg u8, _pad u8, count u32, lastVal u8, _pad[3])` — voice-lane attribution by code site |
 | `IDXR`  | indexed-read VSA summary: `(pc u16, base u16, stride i32, idxMin u8, idxMax u8, _pad u16, count u32)` — table base / element size / length / traversal |
+| `SDDF`  | per-SID-write **DATA-FLOW** summary, keyed by `(PC,reg)` (same key space as `SIDW`, so O(code sites) not O(frames)): a bounded in-emulator backward dynamic slice of each `STA $D4xx`'s value — the slice PCs, classified leaves (`immediate` / `ram_read` / `state_cell`[=SMC] / `exogenous` / `out_of_window`), the value-chain ALU op sequence, a strided-interval VSA for any indexed read feeding the write, and `val_lo/val_hi/val_first`. Turns "PC wrote r" into "how r was computed". Stays a flat ~1 KB as the capture window grows. |
 
-The full byte layout is documented in `src/sidtrace.cpp` (`emit_distill`).
+The full byte layout is documented in `src/sidtrace.cpp` (`emit_distill`). `SDDF`
+is built by a bounded backward slicer over a ring buffer of retired play-call
+instructions (`src/c64/membus_trace.h`, `sliceSidWrite`); it follows data edges
+(store ← value reg's last def; load ← the cell's last writer, possibly a prior
+frame for persistent state; ALU ← operands; indexed ← the index def) and links a
+persistent state cell to the table read that fills it across frames via a bounded
+per-address filler cache — all in-emulator, nothing streamed.
 
 ### `<prefix>.meta.txt`
 

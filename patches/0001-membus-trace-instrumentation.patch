@@ -1,5 +1,5 @@
 diff --git a/src/c64/CPU/mos6510.cpp b/src/c64/CPU/mos6510.cpp
-index 10bec1a1..d1c9b0d9 100644
+index 10bec1a1..12cbe0aa 100644
 --- a/src/c64/CPU/mos6510.cpp
 +++ b/src/c64/CPU/mos6510.cpp
 @@ -26,6 +26,7 @@
@@ -10,7 +10,7 @@ index 10bec1a1..d1c9b0d9 100644
  
  #include <cstdio>
  #include "mos6510debug.h"
-@@ -266,6 +267,13 @@ void MOS6510::fetchNextOpcode()
+@@ -266,6 +267,17 @@ void MOS6510::fetchNextOpcode()
  
      rdyOnThrowAwayRead = false;
  
@@ -19,12 +19,16 @@ index 10bec1a1..d1c9b0d9 100644
 +    // an instruction FETCH (the EXEC access type) so the distiller classifies
 +    // code vs. data vs. self-modifying code by access type (SMC = EXEC & WRITE).
 +    m_membusInstrStartPC = Register_ProgramCounter;
++    // membus-trace: the previous instruction has fully retired here (the register
++    // file reflects its result) -- push it into the slicer's ring buffer and begin
++    // assembling this one, BEFORE the opcode byte is fetched below.
++    MemBusTrace::instance().beginInstr(Register_ProgramCounter);
 +    MemBusTrace::instance().recordFetch(Register_ProgramCounter);
 +
      cycleCount = cpuRead(Register_ProgramCounter) << 3;
      Register_ProgramCounter++;
  
-@@ -335,6 +343,9 @@ void MOS6510::throwAwayRead()
+@@ -335,6 +347,9 @@ void MOS6510::throwAwayRead()
   */
  void MOS6510::FetchDataByte()
  {
@@ -34,7 +38,7 @@ index 10bec1a1..d1c9b0d9 100644
      Cycle_Data = cpuRead(Register_ProgramCounter);
      if (!d1x1)
      {
-@@ -360,6 +371,7 @@ void MOS6510::FetchDataByte()
+@@ -360,6 +375,7 @@ void MOS6510::FetchDataByte()
   */
  void MOS6510::FetchLowAddr()
  {
@@ -42,7 +46,7 @@ index 10bec1a1..d1c9b0d9 100644
      Cycle_EffectiveAddress = cpuRead(Register_ProgramCounter);
      Register_ProgramCounter++;
  
-@@ -402,6 +414,7 @@ void MOS6510::FetchLowAddrY()
+@@ -402,6 +418,7 @@ void MOS6510::FetchLowAddrY()
   */
  void MOS6510::FetchHighAddr()
  {   // Get the high byte of an address from memory
@@ -51,7 +55,7 @@ index 10bec1a1..d1c9b0d9 100644
      Register_ProgramCounter++;
  
 diff --git a/src/c64/CPU/mos6510.h b/src/c64/CPU/mos6510.h
-index 91fb40e6..0a6c9a6d 100644
+index 91fb40e6..ae175517 100644
 --- a/src/c64/CPU/mos6510.h
 +++ b/src/c64/CPU/mos6510.h
 @@ -159,6 +159,11 @@ private:
@@ -66,7 +70,7 @@ index 91fb40e6..0a6c9a6d 100644
      uint8_t Cycle_Data;
      uint8_t Register_StackPointer;
      uint8_t Register_Accumulator;
-@@ -324,6 +329,13 @@ public:
+@@ -324,6 +329,14 @@ public:
  
      inline uint8_t cpuRead(uint_least16_t addr) { return dataBus.cpuRead(addr); }
  
@@ -76,15 +80,16 @@ index 91fb40e6..0a6c9a6d 100644
 +    inline uint_least16_t membusInstrStartPC() const { return m_membusInstrStartPC; }
 +    inline uint8_t membusRegX() const { return Register_X; }
 +    inline uint8_t membusRegY() const { return Register_Y; }
++    inline uint8_t membusRegA() const { return Register_Accumulator; }
 +
      inline void cpuWrite(uint_least16_t addr, uint8_t data) { dataBus.cpuWrite(addr, data); }
  
      void reset();
 diff --git a/src/c64/c64.cpp b/src/c64/c64.cpp
-index b96881a8..8b5bc888 100644
+index b96881a8..9204902d 100644
 --- a/src/c64/c64.cpp
 +++ b/src/c64/c64.cpp
-@@ -89,6 +89,39 @@ c64::c64() :
+@@ -89,6 +89,44 @@ c64::c64() :
      cpu(eventScheduler, cpubus)
  {
      resetIoBank();
@@ -116,6 +121,11 @@ index b96881a8..8b5bc888 100644
 +            return static_cast<MOS6510 *>(ctx)->membusRegY();
 +        };
 +    MemBusTrace::instance().yCtx = &cpu;
++    MemBusTrace::instance().aFn =
++        [](void *ctx) -> uint8_t {
++            return static_cast<MOS6510 *>(ctx)->membusRegA();
++        };
++    MemBusTrace::instance().aCtx = &cpu;
 +    MemBusTrace::instance().ramFn =
 +        [](void *ctx, uint16_t addr) -> uint8_t {
 +            return static_cast<MMU *>(ctx)->readMemByte(addr);
@@ -156,10 +166,10 @@ index 691ab7f8..e82f4a3b 100644
          if (addr >= 0x0400 && addr <= 0x07ff)
 diff --git a/src/c64/membus_trace.h b/src/c64/membus_trace.h
 new file mode 100644
-index 00000000..b6d98387
+index 00000000..35e3d2cc
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,959 @@
 +/*
 + * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
 + * Not part of upstream libsidplayfp. Scratch use only.
@@ -200,6 +210,24 @@ index 00000000..b6d98387
 + *    indexed read, the base (= effective addr - index), element stride, index
 + *    min/max, and access count -- surfaces table base / element-size / length /
 + *    traversal without the raw read stream.
++ *
++ *  - Per-SID-write DATA-FLOW summary (SIDDF). Keyed by (issuing PC, SID register)
++ *    -- the SAME key space as the PC-tagged SID-write summary, so it is O(code
++ *    sites), NOT O(frames). For each distinct STA $D4xx code site, a BOUNDED
++ *    backward dynamic slice is walked, in-emulator, over a small ring buffer of
++ *    the last ~few-hundred RETIRED instructions of the current play-call. The
++ *    slice follows data edges (store <- last def of the value reg; load <- last
++ *    writer of the loaded address, which may be a prior frame -> persistent
++ *    state; ALU ops <- their operands; indexed reads <- the def of the index
++ *    reg). It records, per (PC,reg): the set of PCs in the slice (the generator's
++ *    code), the classified leaf kinds (immediate / ram_read / state_cell[=SMC] /
++ *    exogenous, via the access-type map), a strided-interval VSA for any indexed
++ *    read feeding THIS write, the ALU op sequence on the value-defining chain,
++ *    and min/max/first written value. This turns "we know THAT this PC wrote the
++ *    register" into "we know HOW it computed it" -- the per-write computation DAG
++ *    the recurrence-recovery host needs -- while staying a few KB and FLAT vs run
++ *    length. A leaf whose def-chain exits the ring-buffer window is recorded
++ *    honestly as out-of-window, never by unbounding the buffer.
 + *
 + * A process-global singleton. The c64 object registers getters for the cycle,
 + * the issuing PC, the index register, and the RAM image; the host (sidtrace.cpp)
@@ -266,11 +294,107 @@ index 00000000..b6d98387
 +    bool     baseSet = false;
 +};
 +
++// --- SIDDF (per-write data-flow summary) types ---------------------------
++
++// 6502 register identifiers used by the in-emulator slicer's needed-set.
++enum SliceReg : uint8_t { SR_A = 0, SR_X = 1, SR_Y = 2, SR_NONE = 0xff };
++
++// ALU op kinds recorded on a slice's value-defining chain. These mirror the
++// 6502 ALU the synthesis DSL spans (design 2.5). Loads/stores/transfers are not
++// ALU ops; they carry the value unchanged.
++enum AluOp : uint8_t
++{
++    ALU_NONE = 0,   // load / transfer / store (no arithmetic on the value)
++    ALU_ADC,        // add with carry (+ imm or + mem)
++    ALU_SBC,        // subtract with carry
++    ALU_AND,        // bitwise and
++    ALU_ORA,        // bitwise or
++    ALU_EOR,        // bitwise xor
++    ALU_ASL,        // shift left
++    ALU_LSR,        // shift right
++    ALU_ROL,        // rotate left
++    ALU_ROR,        // rotate right
++    ALU_INC,        // increment (mem or reg INX/INY)
++    ALU_DEC,        // decrement (mem or reg DEX/DEY)
++    ALU_CMP,        // compare (control-edge predicate)
++};
++
++// Leaf classification of a slice leaf (design 3.1 / 2.3).
++enum LeafKind : uint8_t
++{
++    LK_IMMEDIATE = 0,   // an immediate operand byte (a constant K)
++    LK_RAM_READ,        // RAM read as data, not written during play, not exec (song-data K)
++    LK_STATE_CELL,      // EXEC_PLAY & WRITE_PLAY  -> self-modified operand (SMC state)
++                        //  OR  WRITE_PLAY & READ_PLAY in RAM (a persistent zp/ram state cell)
++    LK_EXOGENOUS,       // written during play but owned by another code path / shared counter
++    LK_OUT_OF_WINDOW,   // the def-chain exited the ring buffer (bound may need tuning)
++};
++
++// One leaf of a (PC,reg) slice. Accumulated as a set keyed by (kind, addr/value).
++struct SiddfLeaf
++{
++    uint8_t  kind = LK_OUT_OF_WINDOW;   // LeafKind
++    uint16_t addr = 0;                  // RAM/state/exogenous address (0 for immediate)
++    uint8_t  value = 0;                 // representative value (immediate value, or last seen)
++};
++
++// One retired-instruction record in the ring buffer. Assembled from the bus
++// event stream between opcode-fetch boundaries -- addressing-mode-agnostic.
++struct RetiredInstr
++{
++    uint16_t pc = 0;          // instruction start PC (the code site)
++    uint8_t  opcode = 0;      // first fetched byte at pc
++    bool     gotOpcode = false;
++    uint8_t  imm = 0;         // first operand byte (the immediate, for #imm modes)
++    bool     hasImm = false;
++    uint16_t fetchLo = 0;     // first instruction-fetch address (= opcode addr)
++    uint32_t fetchCount = 0;  // number of code-fetch bytes consumed this instr
++    uint16_t memAddr = 0;     // effective data address (read or write), if any
++    uint8_t  memVal = 0;      // value transferred at memAddr
++    bool     memRead = false; // saw a data read (non-code, non-SID)
++    bool     memWrite = false;// saw a data write (non-SID)
++    uint16_t idxBase = 0;     // memAddr - index, if an indexed data access
++    uint8_t  idxVal = 0;      // the index register value used
++    uint8_t  idxUsed = SR_NONE; // index reg (X/Y) used for an indexed data access
++    uint8_t  regA = 0, regX = 0, regY = 0;   // register file AFTER retirement
++    uint64_t ringSeq = 0;     // monotone retirement sequence (staleness check)
++};
++
++// The accumulated per-(PC,reg) data-flow summary (the SIDDF record).
++struct SiddfSummary
++{
++    uint64_t count = 0;       // number of times this (PC,reg) store retired
++    uint8_t  valLo = 0xff, valHi = 0, valFirst = 0;
++    bool     valSeen = false;
++    // bounded sets (union across all slices of this site; tens of entries)
++    std::vector<uint16_t> slicePcs;     // PCs in the backward slice
++    std::vector<SiddfLeaf> leaves;      // classified leaves
++    std::vector<uint8_t>   opSeq;       // ALU op sequence on the value chain (most-recent->root order; deduped per-slice already short)
++    // strided interval of an indexed read feeding this write (attributed here)
++    bool     hasStride = false;
++    uint16_t strideBase = 0;
++    int32_t  strideStep = 0;
++    uint8_t  strideIdxMin = 0xff;
++    uint8_t  strideIdxMax = 0;
++    bool     anyOutOfWindow = false;
++};
++
 +class MemBusTrace
 +{
 +public:
 +    bool enabled = false;
 +    uint8_t phase = PHASE_BOOT;
++
++    // Ring buffer of retired instructions for the in-emulator backward slicer.
++    // Bounded and FLAT vs run length: it holds at most RING_CAP retired
++    // instructions of the CURRENT play-call, never the whole run. One play-call
++    // can be a few thousand instructions for a busy driver (GoatTracker computes a
++    // SID shadow buffer early in the call and blits it at the end, so a freq
++    // store's backward slice must reach back across the whole call to find the
++    // note-table read that filled the shadow). 4096 covers a full PAL play-call
++    // (~19656 cyc, well under 4096 retired instrs of real work) while peak memory
++    // stays flat: RING_CAP * sizeof(RetiredInstr) ~= 100 KB, independent of N.
++    static constexpr uint32_t RING_CAP = 4096;
 +
 +    // Getters installed by the c64 object (mirror the existing clock getter).
 +    typedef int64_t  (*ClockFn)(void *ctx);
@@ -282,6 +406,7 @@ index 00000000..b6d98387
 +    U16Fn   pcFn    = nullptr; void *pcCtx    = nullptr;  // issuing instr start PC
 +    U8Fn    xFn     = nullptr; void *xCtx     = nullptr;  // X index register
 +    U8Fn    yFn     = nullptr; void *yCtx     = nullptr;  // Y index register
++    U8Fn    aFn     = nullptr; void *aCtx     = nullptr;  // A accumulator
 +    RamFn   ramFn   = nullptr; void *ramCtx   = nullptr;  // live RAM byte getter
 +
 +    // --- distilled state (bounded; never grows with run length) ---
@@ -297,6 +422,55 @@ index 00000000..b6d98387
 +    // Timestamped SID-write stream (small; for the per-frame render gate).
 +    std::vector<SidWrEvent> sidStream;
 +
++    // SIDDF: per-(PC,reg) data-flow summary, same key space as sidWrites.
++    std::map<uint32_t, SiddfSummary> siddf;
++
++    // --- ring buffer of retired instructions (bounded backward-slice window) ---
++    RetiredInstr ring[RING_CAP];
++    uint32_t ringHead = 0;     // index of next slot to write
++    uint32_t ringFill = 0;     // number of valid entries (<= RING_CAP)
++    uint64_t ringSeq  = 0;     // monotone count of retired instrs (for staleness)
++
++    // Per-address last-writer index into the ring, with the monotone sequence at
++    // which it was written. Lets the slicer jump to the def of a memory cell that
++    // was last written MANY instructions ago (a persistent state cell updated only
++    // on note-change frames) without scanning -- and without unbounding the ring.
++    // Bounded: two flat 64 KiB-scale arrays, independent of run length. A def is
++    // usable only if still resident in the ring (seq within the last RING_CAP).
++    uint32_t lastWriteSlot[65536];   // ring slot of the most recent writer
++    uint64_t lastWriteSeq[65536];    // ringSeq when that write retired (0 = none)
++
++    // Per-address "filler" summary: the value-defining slice of the LAST store to
++    // this address, captured AT WRITE TIME (when its data-flow context is resident
++    // in the ring). A persistent state cell that a SID-write reads is filled, on a
++    // far-earlier frame, by such a store (e.g. a note-table read into a SID shadow
++    // buffer); caching the filler links the SID-write site to the table read that
++    // ultimately feeds it, WITHOUT keeping the whole run in the ring. Bounded: one
++    // small record per address, flat vs run length. updated=0 means "no filler".
++    struct FillerSlice
++    {
++        uint64_t updated = 0;     // ringSeq+1 at capture (0 = none)
++        bool     hasStride = false;
++        uint16_t strideBase = 0;
++        uint8_t  idxMin = 0xff, idxMax = 0;
++        uint8_t  srcAddrLeafKindProvisional = LK_RAM_READ;
++        uint16_t srcAddr = 0;     // the table/source address the filler dereferenced
++        bool     hasSrcAddr = false;
++        uint8_t  ops[8] = {0};
++        uint8_t  nOps = 0;
++        uint16_t pcs[8] = {0};
++        uint8_t  nPcs = 0;
++    };
++    std::vector<FillerSlice> filler;   // 65536 entries (sized on clear; ~2.6 MB, flat)
++
++    // The instruction currently being assembled from the bus event stream.
++    RetiredInstr cur;
++    bool curValid = false;     // a boundary has begun an instruction
++    // A code fetch is immediately followed by its cpuRead (same address) on the
++    // bus; this pairs them so an operand-byte read is not mistaken for data.
++    uint16_t pendingFetchAddr = 0;
++    bool     pendingFetch = false;
++
 +    static MemBusTrace &instance()
 +    {
 +        static MemBusTrace inst;
@@ -307,6 +481,7 @@ index 00000000..b6d98387
 +    inline uint16_t pc()  const { return pcFn ? pcFn(pcCtx) : 0; }
 +    inline uint8_t  xreg()const { return xFn ? xFn(xCtx) : 0; }
 +    inline uint8_t  yreg()const { return yFn ? yFn(yCtx) : 0; }
++    inline uint8_t  areg()const { return aFn ? aFn(aCtx) : 0; }
 +
 +    // A normal data access (read or write) on the bus.
 +    inline void record(uint16_t addr, uint8_t val, uint8_t rw)
@@ -320,6 +495,45 @@ index 00000000..b6d98387
 +            acc[addr] |= play ? ACC_READ_PLAY : ACC_READ_INIT;
 +            recordIndexedRead(addr);
 +        }
++        // A read that pairs with the just-issued code fetch is an opcode/operand
++        // byte, not a data access. The first such operand byte is the immediate /
++        // address-low byte; stash it (used as #imm by the slicer when the opcode
++        // is immediate-mode). All other reads/writes are data the slicer follows.
++        if (curValid && !rw && pendingFetch && addr == pendingFetchAddr)
++        {
++            pendingFetch = false;
++            if (cur.fetchCount == 1)        // opcode byte
++            {
++                cur.opcode = val;
++                cur.gotOpcode = true;
++                return;
++            }
++            if (!cur.hasImm)                // first operand byte
++            {
++                cur.imm = val;
++                cur.hasImm = true;
++            }
++            return;
++        }
++        pendingFetch = false;
++
++        // Attribute this data access to the instruction being assembled. The
++        // effective address/value is recorded for ALL accesses (incl. SID-register
++        // stores -- they are the store TARGET the slicer slices on). The slicer
++        // itself never follows a SID-register address as a memory leaf (those
++        // addresses are never added to its needed-memory set), so SID regs are not
++        // mistaken for state. Zero page, RAM, and SMC operands ARE followed.
++        if (curValid)
++        {
++            cur.memAddr = addr;
++            cur.memVal  = val;
++            if (rw) cur.memWrite = true; else cur.memRead = true;
++            // Record the index decomposition for indexed reads (the VSA base).
++            const uint8_t x = xreg(), y = yreg();
++            const uint8_t iu = indexRegFor(cur.opcode);
++            if (iu == SR_X && x) { cur.idxUsed = SR_X; cur.idxVal = x; cur.idxBase = (uint16_t)(addr - x); }
++            else if (iu == SR_Y && y) { cur.idxUsed = SR_Y; cur.idxVal = y; cur.idxBase = (uint16_t)(addr - y); }
++        }
 +        if (rw && addr >= 0xD400 && addr <= 0xD7FF)
 +            recordSidWrite(addr, val);
 +    }
@@ -329,6 +543,54 @@ index 00000000..b6d98387
 +    {
 +        if (!enabled) return;
 +        acc[addr] |= (phase == PHASE_PLAY) ? ACC_EXEC_PLAY : ACC_EXEC_INIT;
++        if (curValid)
++        {
++            if (cur.fetchCount == 0) cur.fetchLo = addr;
++            cur.fetchCount++;
++            pendingFetchAddr = addr;
++            pendingFetch = true;
++        }
++    }
++
++    // Called by the CPU core at the start of each opcode fetch (in
++    // fetchNextOpcode), BEFORE the opcode byte is read: the PREVIOUS instruction
++    // has fully retired (the register file now reflects its result), so push it
++    // into the ring buffer, then begin assembling the new instruction. The opcode
++    // and operand bytes are captured from the paired code-fetch reads.
++    inline void beginInstr(uint16_t startPC)
++    {
++        if (!enabled) return;
++        // Retire the previous instruction (if any) into the ring buffer.
++        if (curValid && phase == PHASE_PLAY && cur.gotOpcode)
++        {
++            cur.regA = areg(); cur.regX = xreg(); cur.regY = yreg();
++            ring[ringHead] = cur;
++            const uint32_t retiredIdx = ringHead;
++            cur.ringSeq = ringSeq;
++            ring[ringHead].ringSeq = ringSeq;
++            // Record this instruction as the last writer of its data address (for
++            // cross-window def lookup of persistent state cells). SID registers are
++            // excluded (they are outputs, never followed as state).
++            if (cur.memWrite &&
++                !(cur.memAddr >= 0xD400 && cur.memAddr <= 0xD7FF))
++            {
++                lastWriteSlot[cur.memAddr] = retiredIdx;
++                lastWriteSeq[cur.memAddr]  = ringSeq + 1;   // +1 so 0 means "none"
++                if (isStore(cur.opcode))
++                    captureFiller(cur.memAddr, retiredIdx);
++            }
++            ringHead = (ringHead + 1) % RING_CAP;
++            if (ringFill < RING_CAP) ringFill++;
++            ringSeq++;
++            // If the just-retired instruction was a STA/STX/STY $D4xx, slice it
++            // now (its full data-flow context is in the ring buffer below it).
++            if (cur.memWrite && cur.memAddr >= 0xD400 && cur.memAddr <= 0xD418)
++                sliceSidWrite(retiredIdx);
++        }
++        cur = RetiredInstr{};
++        cur.pc = startPC;
++        curValid = true;
++        pendingFetch = false;
 +    }
 +
 +    // Capture the live RAM image once, at the init->play boundary.
@@ -349,6 +611,16 @@ index 00000000..b6d98387
 +        sidWrites.clear();
 +        idxReads.clear();
 +        sidStream.clear();
++        siddf.clear();
++        ringHead = 0;
++        ringFill = 0;
++        ringSeq = 0;
++        std::memset(lastWriteSlot, 0, sizeof(lastWriteSlot));
++        std::memset(lastWriteSeq, 0, sizeof(lastWriteSeq));
++        filler.assign(65536, FillerSlice{});
++        curValid = false;
++        cur = RetiredInstr{};
++        pendingFetch = false;
 +    }
 +
 +private:
@@ -389,6 +661,468 @@ index 00000000..b6d98387
 +        if (idx < s.idxMin) s.idxMin = idx;
 +        if (idx > s.idxMax) s.idxMax = idx;
 +        s.count++;
++    }
++
++    // ----- 6502 opcode semantics for the slicer (def/use/ALU classification) ---
++    // These are HARDWARE facts about the 6502 ISA (which register an opcode
++    // defines, which it uses, what ALU op it performs, whether it reads memory)
++    // -- NOT any tracker/player format knowledge. Illegal/undocumented opcodes
++    // that A Mind uses are handled by the common families below; anything not
++    // recognised contributes no edge (the slice records it as a PC but follows no
++    // operand, which the residual gate will surface if it matters).
++
++    // Which register (if any) the opcode DEFINES (writes its result to).
++    static inline uint8_t defReg(uint8_t op)
++    {
++        switch (op)
++        {
++        // loads / arithmetic / logic into A
++        case 0xA9: case 0xA5: case 0xB5: case 0xAD: case 0xBD: case 0xB9:
++        case 0xA1: case 0xB1:                                   // LDA
++        case 0x69: case 0x65: case 0x75: case 0x6D: case 0x7D: case 0x79:
++        case 0x61: case 0x71:                                   // ADC
++        case 0xE9: case 0xE5: case 0xF5: case 0xED: case 0xFD: case 0xF9:
++        case 0xE1: case 0xF1:                                   // SBC
++        case 0x29: case 0x25: case 0x35: case 0x2D: case 0x3D: case 0x39:
++        case 0x21: case 0x31:                                   // AND
++        case 0x09: case 0x05: case 0x15: case 0x0D: case 0x1D: case 0x19:
++        case 0x01: case 0x11:                                   // ORA
++        case 0x49: case 0x45: case 0x55: case 0x4D: case 0x5D: case 0x59:
++        case 0x41: case 0x51:                                   // EOR
++        case 0x0A:                                              // ASL A
++        case 0x4A:                                              // LSR A
++        case 0x2A:                                              // ROL A
++        case 0x6A:                                              // ROR A
++        case 0x8A:                                              // TXA
++        case 0x98:                                              // TYA
++        case 0x68:                                              // PLA
++            return SR_A;
++        }
++        // Illegal/undocumented opcodes that load A (A Mind Is Born relies on
++        // these; the emulator already runs them, so the slice must follow them).
++        switch (op)
++        {
++        case 0xAB:                                             // LAX # (ATX/LXA)
++        case 0xA7: case 0xB7: case 0xAF: case 0xBF: case 0xA3: case 0xB3: // LAX
++        case 0x4B:                                             // ALR  (AND+LSR -> A)
++        case 0x0B: case 0x2B:                                 // ANC  -> A
++        case 0x6B:                                             // ARR  -> A
++        case 0xEB:                                             // SBC# (illegal alias)
++            return SR_A;   // (LAX also loads X; handled as a secondary def below)
++        }
++        switch (op)
++        {
++        case 0xA2: case 0xA6: case 0xB6: case 0xAE: case 0xBE:  // LDX
++        case 0xAA:                                              // TAX
++        case 0xE8:                                              // INX
++        case 0xCA:                                              // DEX
++        case 0xBA:                                              // TSX
++        case 0xCB:                                             // AXS/SBX -> X
++            return SR_X;
++        case 0xA0: case 0xA4: case 0xB4: case 0xAC: case 0xBC:  // LDY
++        case 0xA8:                                              // TAY
++        case 0xC8:                                              // INY
++        case 0x88:                                              // DEY
++            return SR_Y;
++        }
++        return SR_NONE;
++    }
++
++    // Does the opcode ALSO define X (LAX loads A and X together)?
++    static inline bool alsoDefsX(uint8_t op)
++    {
++        switch (op)
++        {
++        case 0xAB: case 0xA7: case 0xB7: case 0xAF: case 0xBF:
++        case 0xA3: case 0xB3:
++            return true;
++        }
++        return false;
++    }
++
++    // The ALU op the opcode performs on the value chain (ALU_NONE for plain
++    // load/store/transfer).
++    static inline uint8_t aluOp(uint8_t op)
++    {
++        switch (op)
++        {
++        case 0x69: case 0x65: case 0x75: case 0x6D: case 0x7D: case 0x79:
++        case 0x61: case 0x71: return ALU_ADC;
++        case 0xE9: case 0xE5: case 0xF5: case 0xED: case 0xFD: case 0xF9:
++        case 0xE1: case 0xF1: return ALU_SBC;
++        case 0x29: case 0x25: case 0x35: case 0x2D: case 0x3D: case 0x39:
++        case 0x21: case 0x31: return ALU_AND;
++        case 0x09: case 0x05: case 0x15: case 0x0D: case 0x1D: case 0x19:
++        case 0x01: case 0x11: return ALU_ORA;
++        case 0x49: case 0x45: case 0x55: case 0x4D: case 0x5D: case 0x59:
++        case 0x41: case 0x51: return ALU_EOR;
++        case 0x0A: case 0x06: case 0x16: case 0x0E: case 0x1E: return ALU_ASL;
++        case 0x4A: case 0x46: case 0x56: case 0x4E: case 0x5E: return ALU_LSR;
++        case 0x2A: case 0x26: case 0x36: case 0x2E: case 0x3E: return ALU_ROL;
++        case 0x6A: case 0x66: case 0x76: case 0x6E: case 0x7E: return ALU_ROR;
++        case 0xE6: case 0xF6: case 0xEE: case 0xFE: case 0xE8: case 0xC8:
++            return ALU_INC;
++        case 0xC6: case 0xD6: case 0xCE: case 0xDE: case 0xCA: case 0x88:
++            return ALU_DEC;
++        case 0xC9: case 0xC5: case 0xD5: case 0xCD: case 0xDD: case 0xD9:
++        case 0xC1: case 0xD1:                                   // CMP
++        case 0xE0: case 0xE4: case 0xEC:                        // CPX
++        case 0xC0: case 0xC4: case 0xCC:                        // CPY
++            return ALU_CMP;
++        }
++        return ALU_NONE;
++    }
++
++    // Does the opcode take a second source operand from MEMORY (so the slicer
++    // must follow the loaded address) as opposed to an immediate / register-only?
++    static inline bool readsMem(uint8_t op)
++    {
++        switch (op)
++        {
++        // immediate-mode (operand is a constant, no memory source)
++        case 0xA9: case 0xA2: case 0xA0:                        // LDA/X/Y #
++        case 0x69: case 0xE9: case 0x29: case 0x09: case 0x49:  // ADC/SBC/AND/ORA/EOR #
++        case 0xC9: case 0xE0: case 0xC0:                        // CMP/CPX/CPY #
++        case 0x0A: case 0x4A: case 0x2A: case 0x6A:             // shifts on A
++        case 0x8A: case 0x98: case 0xAA: case 0xA8: case 0xBA:  // transfers
++        case 0xE8: case 0xCA: case 0xC8: case 0x88:             // INX/DEX/INY/DEY
++        case 0x68:                                              // PLA
++        case 0xAB: case 0x4B: case 0x0B: case 0x2B: case 0x6B:  // LAX#/ALR/ANC/ARR (imm)
++        case 0xCB:                                              // AXS/SBX #
++            return false;
++        }
++        return true;   // any other recognised value-defining op reads memory
++    }
++
++    // Which index register an opcode's effective address uses (indexed modes).
++    static inline uint8_t indexRegFor(uint8_t op)
++    {
++        switch (op)
++        {
++        case 0xBD: case 0x7D: case 0xFD: case 0x3D: case 0x1D: case 0x5D: // ,X abs
++        case 0xB5: case 0x75: case 0xF5: case 0x35: case 0x15: case 0x55: // ,X zp
++        case 0xBC: case 0xDE: case 0xFE: case 0x1E: case 0x3E: case 0x5E:
++        case 0x7E: case 0x9D: case 0xD6: case 0xF6: case 0x16: case 0x36:
++        case 0x56: case 0x76: case 0x95: case 0xB6: /* LDX zp,Y handled below */
++        case 0xA1: case 0xC1: case 0xE1: case 0x21: case 0x41: case 0x61:
++        case 0x01: case 0x81:                                   // (zp,X)
++            return SR_X;
++        case 0xB9: case 0x79: case 0xF9: case 0x39: case 0x19: case 0x59: // ,Y abs
++        case 0xBE: case 0x99: case 0xD9:                        // ,Y
++        case 0xB1: case 0xD1: case 0xF1: case 0x31: case 0x11: case 0x51:
++        case 0x71: case 0x91:                                   // (zp),Y
++        case 0xB7: case 0xBF: case 0xB3:                        // LAX zp,Y / abs,Y / (zp),Y
++            return SR_Y;
++        }
++        // LDX abs,Y (0xBE), LDX zp,Y (0xB6) already mapped; default none.
++        switch (op) { case 0xB6: case 0xBE: return SR_Y; }
++        return SR_NONE;
++    }
++
++    // The source register of a store (STA/STX/STY).
++    static inline uint8_t storeSrcReg(uint8_t op)
++    {
++        switch (op)
++        {
++        case 0x85: case 0x95: case 0x8D: case 0x9D: case 0x99:
++        case 0x81: case 0x91: return SR_A;                      // STA
++        case 0x86: case 0x96: case 0x8E: return SR_X;           // STX
++        case 0x84: case 0x94: case 0x8C: return SR_Y;           // STY
++        }
++        return SR_A;   // default (covers SAX-style illegal stores -> A&X, treat A)
++    }
++
++    static inline bool isStore(uint8_t op)
++    {
++        switch (op)
++        {
++        case 0x85: case 0x95: case 0x8D: case 0x9D: case 0x99:
++        case 0x81: case 0x91:                                   // STA
++        case 0x86: case 0x96: case 0x8E:                        // STX
++        case 0x84: case 0x94: case 0x8C:                        // STY
++            return true;
++        }
++        return false;
++    }
++
++    // Classify a leaf address against the access-type map (design 2.3 / 3.1).
++    inline uint8_t classifyLeaf(uint16_t addr) const
++    {
++        const uint8_t b = acc[addr];
++        const bool execAny  = b & (ACC_EXEC_INIT | ACC_EXEC_PLAY);
++        const bool writePlay = b & ACC_WRITE_PLAY;
++        const bool readPlay  = b & ACC_READ_PLAY;
++        // SMC: executed AND written during play -> a self-modified operand byte,
++        // mutable STATE (not constant, not plain data). This is the case the model
++        // requires be classified as state_cell, never as a constant.
++        if (execAny && writePlay) return LK_STATE_CELL;
++        // A RAM cell written during play and also read as data during play is a
++        // persistent state cell (zp accumulator / cursor / counter).
++        if (writePlay && readPlay && addr < 0xd000) return LK_STATE_CELL;
++        // Written during play but not read back here as our own state: an
++        // exogenous source owned by another path (e.g. a shared counter cell).
++        if (writePlay) return LK_EXOGENOUS;
++        // Read as data during play, never written, never executed: a constant /
++        // song-data table byte (K).
++        if (readPlay && !execAny) return LK_RAM_READ;
++        return LK_RAM_READ;
++    }
++
++    inline RetiredInstr &ringAt(uint32_t i) { return ring[i % RING_CAP]; }
++
++    // Add a PC to a slice's PC set (bounded; dedup).
++    static inline void addPc(SiddfSummary &s, uint16_t p)
++    {
++        if (s.slicePcs.size() >= 64) return;
++        for (uint16_t q : s.slicePcs) if (q == p) return;
++        s.slicePcs.push_back(p);
++    }
++    static inline void addLeaf(SiddfSummary &s, uint8_t kind, uint16_t addr, uint8_t val)
++    {
++        if (kind == LK_OUT_OF_WINDOW) s.anyOutOfWindow = true;
++        if (s.leaves.size() >= 64) return;
++        for (const auto &l : s.leaves)
++            if (l.kind == kind && l.addr == addr) return;
++        s.leaves.push_back(SiddfLeaf{ kind, addr, val });
++    }
++
++    // Capture the value-defining slice of a just-retired STORE to `addr` (slot
++    // `slot`), so a later SID-write whose persistent state cell is `addr` can be
++    // linked to the table read / arithmetic that filled it. A short bounded local
++    // backward scan from `slot` resolving the source register; records the indexed
++    // read's strided interval + source address and the value ALU op sequence.
++    inline void captureFiller(uint16_t addr, uint32_t slot)
++    {
++        if (filler.empty()) return;
++        const RetiredInstr &stw = ring[slot];
++        uint8_t needR = storeSrcReg(stw.opcode);
++        FillerSlice fs;
++        fs.updated = ringSeq + 1;
++        const uint32_t windowLen = ringFill < RING_CAP ? ringFill : RING_CAP;
++        uint32_t idx = slot;
++        bool needReg = true;
++        for (uint32_t steps = 0; steps < windowLen && (needReg) && fs.nPcs < 8; ++steps)
++        {
++            idx = (idx == 0) ? (RING_CAP - 1) : (idx - 1);
++            const RetiredInstr &in = ring[idx];
++            const uint8_t dr = defReg(in.opcode);
++            const bool defs = (dr == needR) || (needR == SR_X && alsoDefsX(in.opcode));
++            if (!defs) continue;
++            if (fs.nPcs < 8) fs.pcs[fs.nPcs++] = in.pc;
++            const uint8_t a = aluOp(in.opcode);
++            if (dr == SR_A && a != ALU_NONE && fs.nOps < 8) fs.ops[fs.nOps++] = a;
++            if (readsMem(in.opcode) && (in.memRead || in.memWrite))
++            {
++                if (in.idxUsed != SR_NONE)
++                {
++                    fs.hasStride = true; fs.strideBase = in.idxBase;
++                    if (in.idxVal < fs.idxMin) fs.idxMin = in.idxVal;
++                    if (in.idxVal > fs.idxMax) fs.idxMax = in.idxVal;
++                }
++                fs.hasSrcAddr = true; fs.srcAddr = in.memAddr;
++                needReg = false;   // reached the load (the source) -> stop
++            }
++            else
++            {
++                // transfer chains: keep chasing the carried register
++                switch (in.opcode)
++                {
++                case 0x8A: needR = SR_X; break;
++                case 0x98: needR = SR_Y; break;
++                case 0xAA: case 0xA8: needR = SR_A; break;
++                default: needReg = false; break;   // immediate/shift -> done
++                }
++            }
++        }
++        filler[addr] = fs;
++    }
++
++    // A work item for the slicer: resolve register `reg` (or a memory address)
++    // as it stood JUST BEFORE ring slot `anchor` (i.e. scan strictly earlier).
++    struct SliceTask { uint32_t anchor; uint8_t reg; uint16_t mem; bool isReg; };
++
++    // ----- the bounded backward dynamic slicer ------------------------------
++    // ringIdx is the ring slot of the just-retired STA/STX/STY $D4xx. Build the
++    // backward dynamic slice of the stored value over the ring buffer. Each task
++    // is resolved by a LOCAL backward scan from its anchor slot: register tasks
++    // stop at the nearest prior definer; memory tasks jump directly to the last
++    // writer of that address (via lastWriteSlot), which may be MANY instructions
++    // back (a persistent state cell updated only on a note-change frame) -- this
++    // is how cross-frame state/def edges enter the slice without unbounding the
++    // ring. Records: slice PCs, classified leaves, value-chain ALU ops, and any
++    // indexed-read strided interval, all keyed to this store's (PC,reg). All sets
++    // are bounded; a def that has fallen out of the ring is an out-of-window leaf.
++    inline void sliceSidWrite(uint32_t ringIdx)
++    {
++        const RetiredInstr st = ring[ringIdx];
++        const uint8_t reg = (uint8_t)(st.memAddr & 0x1f);
++        const uint32_t key = ((uint32_t)st.pc << 5) | reg;
++        SiddfSummary &s = siddf[key];
++
++        if (!s.valSeen) { s.valFirst = st.memVal; s.valSeen = true; }
++        if (st.memVal < s.valLo) s.valLo = st.memVal;
++        if (st.memVal > s.valHi) s.valHi = st.memVal;
++        s.count++;
++        addPc(s, st.pc);
++
++        // The slice shape/op-seq is invariant across frames; do the full walk only
++        // for the first N occurrences (later walks would not grow the union). The
++        // strided interval still refines on every walk (cheap).
++        if (s.count > 32) return;
++        const bool firstWalk = (s.count == 1);
++
++        const uint32_t windowLen = ringFill < RING_CAP ? ringFill : RING_CAP;
++        const uint64_t oldestSeq = (ringSeq > windowLen) ? (ringSeq - windowLen) : 0;
++
++        // Bounded worklist (FIFO). Caps keep the walk O(code-sites)-bounded.
++        SliceTask wl[128];
++        uint32_t wlHead = 0, wlTail = 0;
++        auto push = [&](SliceTask t) { if (wlTail < 128) wl[wlTail++] = t; };
++
++        // resolved-task memo to avoid revisiting (small fixed table)
++        push(SliceTask{ ringIdx, storeSrcReg(st.opcode), 0, true });
++
++        uint32_t resolved = 0;
++        while (wlHead < wlTail && resolved < 256)
++        {
++            SliceTask t = wl[wlHead++];
++            ++resolved;
++
++            if (!t.isReg)
++            {
++                // Resolve a memory address: jump to its last writer if resident.
++                const uint16_t a = t.mem;
++                const uint64_t wseq = lastWriteSeq[a];      // 0 = never written
++                if (wseq != 0 && (wseq - 1) >= oldestSeq && (wseq - 1) < ringSeq)
++                {
++                    const uint32_t wslot = lastWriteSlot[a];
++                    // confirm the slot still holds that exact writer (not wrapped)
++                    if (ring[wslot].ringSeq == (wseq - 1) && ring[wslot].memWrite &&
++                        ring[wslot].memAddr == a)
++                    {
++                        RetiredInstr &w = ring[wslot];
++                        addPc(s, w.pc);
++                        if (isStore(w.opcode))
++                        {
++                            push(SliceTask{ wslot, storeSrcReg(w.opcode), 0, true });
++                            if (w.idxUsed != SR_NONE)
++                                push(SliceTask{ wslot, w.idxUsed, 0, true });
++                        }
++                        else
++                        {   // in-place RMW (INC/DEC/ASL on memory): new = op(old).
++                            // The cell IS persistent state (its prior value carries
++                            // between calls); record it as a state leaf and the op,
++                            // but do NOT chase its prior value (that would loop on
++                            // the same self-referential cell). This is the counter
++                            // recurrence s' = s + 1 / s - 1.
++                            const uint8_t op = aluOp(w.opcode);
++                            if (firstWalk && op != ALU_NONE && s.opSeq.size() < 32)
++                                s.opSeq.push_back(op);
++                            addLeaf(s, LK_RAM_READ, a, ramFn ? ramFn(ramCtx, a) : 0);
++                        }
++                        continue;
++                    }
++                }
++                // No resident writer: it is a LEAF (constant / persistent state /
++                // exogenous), classified against the final access-type map later.
++                addLeaf(s, LK_RAM_READ, a, ramFn ? ramFn(ramCtx, a) : 0);
++                // If this cell is a persistent state cell that was FILLED (on a
++                // far-earlier frame, out of the ring) by a store whose value came
++                // from a table read / arithmetic, link that filler's findings to
++                // this axis -- this is how the note-table read attributes to the
++                // freq SID-write site even though a held note's table read is many
++                // frames back. (design 2.3/2.4: persistent state entering the slice
++                // + the array K the filler dereferenced.)
++                // Merge on ANY walk (not just the first): a held note's filler is
++                // only populated once the note first CHANGES, which may be after
++                // this site's first walk. The merge is idempotent -- stride,
++                // leaves and PCs dedup; op_seq is taken once (when still empty).
++                if (!filler.empty() && filler[a].updated)
++                {
++                    const FillerSlice &fs = filler[a];
++                    if (fs.hasStride && !s.hasStride)
++                    {
++                        s.hasStride = true;
++                        s.strideBase = fs.strideBase;
++                        if (fs.idxMin < s.strideIdxMin) s.strideIdxMin = fs.idxMin;
++                        if (fs.idxMax > s.strideIdxMax) s.strideIdxMax = fs.idxMax;
++                    }
++                    if (fs.hasSrcAddr)
++                        addLeaf(s, LK_RAM_READ, fs.srcAddr,
++                                ramFn ? ramFn(ramCtx, fs.srcAddr) : 0);
++                    for (uint8_t i = 0; i < fs.nPcs; ++i) addPc(s, fs.pcs[i]);
++                    if (s.opSeq.empty())
++                        for (uint8_t i = 0; i < fs.nOps && s.opSeq.size() < 32; ++i)
++                            s.opSeq.push_back(fs.ops[i]);
++                }
++                continue;
++            }
++
++            // Resolve a register: scan strictly backward from the anchor slot to
++            // the nearest prior instruction that defines it.
++            bool found = false;
++            uint32_t idx = t.anchor;
++            for (uint32_t steps = 0; steps < windowLen; ++steps)
++            {
++                idx = (idx == 0) ? (RING_CAP - 1) : (idx - 1);
++                RetiredInstr &in = ring[idx];
++                const uint8_t dr = defReg(in.opcode);
++                const bool defs = (dr == t.reg) ||
++                                  (t.reg == SR_X && alsoDefsX(in.opcode));
++                if (!defs) continue;
++
++                found = true;
++                addPc(s, in.pc);
++                const uint8_t a = aluOp(in.opcode);
++                if (firstWalk && dr == SR_A && a != ALU_NONE && s.opSeq.size() < 32)
++                    s.opSeq.push_back(a);
++
++                if (readsMem(in.opcode) && (in.memRead || in.memWrite))
++                {
++                    if (in.idxUsed != SR_NONE)
++                    {
++                        if (!s.hasStride) { s.hasStride = true; s.strideBase = in.idxBase; }
++                        const uint8_t iv = in.idxVal;
++                        if (iv < s.strideIdxMin) s.strideIdxMin = iv;
++                        if (iv > s.strideIdxMax) s.strideIdxMax = iv;
++                        push(SliceTask{ idx, in.idxUsed, 0, true });
++                    }
++                    push(SliceTask{ idx, 0, in.memAddr, false });
++                }
++                else
++                {
++                    const uint8_t a2 = aluOp(in.opcode);
++                    switch (in.opcode)
++                    {
++                    case 0x8A: push(SliceTask{ idx, SR_X, 0, true }); break; // TXA
++                    case 0x98: push(SliceTask{ idx, SR_Y, 0, true }); break; // TYA
++                    case 0xAA: case 0xA8: push(SliceTask{ idx, SR_A, 0, true }); break;
++                    default: break;
++                    }
++                    if (firstWalk && in.hasImm &&
++                        (in.opcode == 0xA9 || in.opcode == 0xA2 || in.opcode == 0xA0 ||
++                         a2 == ALU_ADC || a2 == ALU_SBC || a2 == ALU_AND ||
++                         a2 == ALU_ORA || a2 == ALU_EOR || a2 == ALU_CMP))
++                        addLeaf(s, LK_IMMEDIATE, 0, in.imm);
++                }
++                break;
++            }
++            if (!found) addLeaf(s, LK_OUT_OF_WINDOW, 0, 0);
++        }
++    }
++
++public:
++    // Reclassify every memory leaf against the FINAL access-type map. Called once
++    // after the run, before serialization. Immediate and out-of-window leaves are
++    // left as-is; memory leaves (recorded provisionally as RAM_READ during the
++    // bounded walk) are upgraded to STATE_CELL / EXOGENOUS / RAM_READ per their
++    // accumulated access type (design 2.3): this is the SMC-correct classifier.
++    void finalizeLeaves()
++    {
++        for (auto &kv : siddf)
++            for (auto &l : kv.second.leaves)
++                if (l.kind == LK_RAM_READ)
++                    l.kind = classifyLeaf(l.addr);
 +    }
 +};
 +

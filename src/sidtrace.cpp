@@ -88,6 +88,24 @@ static std::vector<uint8_t> readFile(const char *path)
  *     _pad u16, n u32) -- table base / element size / length / traversal.
  *       tag char[4] "IDXR"; nentries u32; then the entries.
  *
+ *   SECTION "SIDDF" (per-SID-write DATA-FLOW summary; design 3.1).  Keyed by
+ *     (issuing PC, SID register) -- the SAME key space as SIDW, so O(code sites)
+ *     NOT O(frames).  For each STA $D4xx code site, a BOUNDED in-emulator backward
+ *     dynamic slice (over a ring buffer of retired play-call instructions): the
+ *     slice PC set (the generator's code), the classified leaves (immediate /
+ *     ram_read / state_cell[=SMC] / exogenous / out-of-window via the access-type
+ *     map), the ALU op sequence on the value chain, a strided-interval VSA for any
+ *     indexed read feeding THIS write, and min/max/first written value.  This is
+ *     the per-write computation DAG the recurrence-recovery host needs.  Tag is 4
+ *     bytes "SDDF".  Layout: tag; nentries u32; then per entry:
+ *        pc u16, reg u8, flags u8 (bit0=hasStride, bit1=anyOutOfWindow),
+ *        count u32,
+ *        valLo u8, valHi u8, valFirst u8, _pad u8,
+ *        strideBase u16, strideStep i32, strideIdxMin u8, strideIdxMax u8,
+ *        nPcs u16,   then nPcs * (pc u16),
+ *        nLeaves u16, then nLeaves * (kind u8, _pad u8, addr u16, value u8, _pad u8),
+ *        nOps u16,   then nOps * (op u8).
+ *
  *   SECTION "END\0" terminates.
  *
  * Returns the artifact size in bytes.
@@ -236,6 +254,46 @@ static long emit_distill(const char *path, MemBusTrace &tr,
             wr_u8(f, kv.second.idxMax);
             wr_u16(f, 0);
             wr_u32(f, (uint32_t)kv.second.count);
+        }
+    }
+
+    // SIDDF: per-(PC,reg) data-flow summary (the per-write computation DAG).
+    {
+        fwrite("SDDF", 1, 4, f);
+        wr_u32(f, (uint32_t)tr.siddf.size());
+        for (const auto &kv : tr.siddf)
+        {
+            const uint16_t pc = (uint16_t)(kv.first >> 5);
+            const uint8_t  reg = (uint8_t)(kv.first & 0x1f);
+            const libsidplayfp::SiddfSummary &s = kv.second;
+            uint8_t flags = 0;
+            if (s.hasStride)      flags |= 0x01;
+            if (s.anyOutOfWindow) flags |= 0x02;
+            wr_u16(f, pc);
+            wr_u8(f, reg);
+            wr_u8(f, flags);
+            wr_u32(f, (uint32_t)s.count);
+            wr_u8(f, s.valSeen ? s.valLo : 0);
+            wr_u8(f, s.valHi);
+            wr_u8(f, s.valFirst);
+            wr_u8(f, 0);
+            wr_u16(f, s.strideBase);
+            wr_i32(f, s.strideStep);
+            wr_u8(f, s.strideIdxMin == 0xff ? 0 : s.strideIdxMin);
+            wr_u8(f, s.strideIdxMax);
+            wr_u16(f, (uint16_t)s.slicePcs.size());
+            for (uint16_t p : s.slicePcs) wr_u16(f, p);
+            wr_u16(f, (uint16_t)s.leaves.size());
+            for (const auto &l : s.leaves)
+            {
+                wr_u8(f, l.kind);
+                wr_u8(f, 0);
+                wr_u16(f, l.addr);
+                wr_u8(f, l.value);
+                wr_u8(f, 0);
+            }
+            wr_u16(f, (uint16_t)s.opSeq.size());
+            for (uint8_t op : s.opSeq) wr_u8(f, op);
         }
     }
 
@@ -394,6 +452,21 @@ int main(int argc, char **argv)
         fclose(fs);
     }
     const uint64_t nSid = (uint64_t)tr.sidStream.size();
+
+    // Debug aid (off by default): dump the full post-init RAM image so the
+    // zero-page-relocated players can be disassembled offline. Not part of the
+    // SDST artifact.
+    if (getenv("SIDTRACE_DUMP_RAM"))
+    {
+        const std::string rp = outPrefix + ".ram.bin";
+        FILE *fr = fopen(rp.c_str(), "wb");
+        if (fr) { fwrite(tr.ramSnapshot, 1, 65536, fr); fclose(fr); }
+    }
+
+    // Reclassify SIDDF memory leaves against the final access-type map (a state
+    // cell first read on frame 1 before its play-write would otherwise look
+    // read-only). Deterministic: depends only on the accumulated acc map.
+    tr.finalizeLeaves();
 
     // --- emit the compact distilled artifact (SDST) ---
     const long distillBytes =

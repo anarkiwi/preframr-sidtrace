@@ -33,6 +33,8 @@ from sidtrace_records import (  # noqa: E402
     ACC_EXEC_PLAY,
     ACC_READ_PLAY,
     ACC_WRITE_PLAY,
+    LK_IMMEDIATE,
+    LK_STATE_CELL,
     SIDWR_DT,
     load_sidwr,
     parse_meta,
@@ -191,6 +193,72 @@ def test_deterministic_over_many_runs(tmp_path, fixture_sid):
             )
         )
     assert len(digests) == 1, f"non-deterministic over 5 runs: {digests}"
+
+
+def test_siddf_present_and_keyed_by_pc_reg(trace):
+    """The per-write data-flow summary (SIDDF) exists and shares SIDW's (PC,reg)
+    key space -- it is O(code sites), not O(frames)."""
+    d = parse_sdst(trace["distill"])
+    assert d["siddf"], "no SIDDF data-flow summaries emitted"
+    sidw_keys = {(pc, reg) for pc, reg, _c, _v in d["sid_writes"]}
+    siddf_keys = {(e["pc"], e["reg"]) for e in d["siddf"]}
+    # every data-flow site corresponds to a real SID-write site
+    assert siddf_keys <= sidw_keys
+    # the regs covered include the fixture's distinct write registers
+    assert {0x00, 0x01, 0x04, 0x18} <= {e["reg"] for e in d["siddf"]}
+
+
+def test_siddf_classifies_state_vs_constant(trace):
+    """The fixture's freq-lo ($D400) is loaded from a RAM counter that is
+    INC'd every play-call -> its slice leaf must be a STATE_CELL (read+write
+    during play), NOT a constant. The immediate-loaded registers (#$11 ->
+    $D401, #$21 -> $D404, #$0F -> $D418) must surface an IMMEDIATE leaf and a
+    constant value range (val_lo == val_hi)."""
+    d = parse_sdst(trace["distill"])
+    by_reg = {e["reg"]: e for e in d["siddf"]}
+
+    fr = by_reg[0x00]  # freq-lo, fed by the INC'd counter
+    leaf_kinds = {k for k, _a, _v in fr["leaves"]}
+    assert LK_STATE_CELL in leaf_kinds, (
+        "freq-lo's counter source must classify as state_cell, not constant"
+    )
+    # the counter is genuinely mutable -> the written value is not constant
+    assert fr["val_lo"] != fr["val_hi"]
+
+    for reg in (0x01, 0x04, 0x18):  # immediate-loaded -> constant
+        e = by_reg[reg]
+        kinds = {k for k, _a, _v in e["leaves"]}
+        assert LK_IMMEDIATE in kinds, f"reg {reg:#x} should have an immediate leaf"
+        assert e["val_lo"] == e["val_hi"], f"reg {reg:#x} should be constant"
+
+
+def test_siddf_flat_vs_capture_length(tmp_path, fixture_sid):
+    """The decisive length-independence property: the SIDDF section size does NOT
+    grow with the number of frames captured (it is keyed by code site). Trace a
+    short and a long window and require the SIDDF byte count to be identical."""
+
+    def siddf_nbytes(distill_path):
+        buf = distill_path.read_bytes()
+        i = buf.find(b"SDDF")
+        assert i >= 0
+        j = buf.find(b"END\x00", i)
+        return (j if j >= 0 else len(buf)) - i
+
+    def trace_n(prefix, n):
+        subprocess.run(
+            [_sidtrace_bin(), str(fixture_sid), "1", str(n), str(prefix)],
+            check=True,
+        )
+        return Path(f"{prefix}.distill.bin")
+
+    short = trace_n(tmp_path / "short", 30)
+    long = trace_n(tmp_path / "long", 600)
+    sw_short = load_sidwr(Path(str(short).replace(".distill.bin", ".sidwr.bin")))
+    sw_long = load_sidwr(Path(str(long).replace(".distill.bin", ".sidwr.bin")))
+    assert sw_long.size > sw_short.size * 5, "long capture should have many more writes"
+    assert siddf_nbytes(short) == siddf_nbytes(long), (
+        "SIDDF size grew with capture length -- it must be O(code sites), not O(frames)"
+    )
 
 
 def test_per_frame_write_cadence(trace):
