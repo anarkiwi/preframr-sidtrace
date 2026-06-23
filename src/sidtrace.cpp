@@ -80,8 +80,12 @@ static std::vector<uint8_t> readFile(const char *path)
  *     never written/executed during play, inside the loaded image span); (2) ANY
  *     cell READ AS DATA during play within zero page or the loaded image span --
  *     so a self-relocating generative player's zero-page generator tables (A Mind
- *     keeps its tables in EXEC'd zp $f3/$f7) are captured too. The host classifies
- *     code/data/SMC via ACMP; SNAP is just the verbatim byte value.
+ *     keeps its tables in EXEC'd zp $f3/$f7) are captured too. The snapshot is the
+ *     UNDERLYING 64 KiB RAM (raw ram[], banking-independent), so a player loaded
+ *     INTO the RAM banked under I/O ($d000-$dfff) / KERNAL ($e000-$ffff) -- e.g. a
+ *     $e800 driver -- is captured verbatim; the image span [loadLo,loadHi) bounds
+ *     it. The host classifies code/data/SMC via ACMP; SNAP is just the verbatim
+ *     byte value.
  *       tag char[4] "SNAP"; nbytes u32; then the (addr,len,bytes) runs.
  *
  *   SECTION "SIDW" (PC-tagged SID-write summary):  voice-lane attribution by
@@ -231,7 +235,16 @@ static long emit_distill(const char *path, MemBusTrace &tr,
         const uint32_t loadLo = ti ? ti->loadAddr() : 0;
         const uint32_t loadHi = ti ? (loadLo + ti->c64dataLen()) : 0x10000;
         auto eligible = [&](uint32_t a) -> bool {
-            if (a < 0x0002 || a >= 0xd000) return false;   // RAM only, skip IO
+            // RAM only ($0002..$ffff). tr.ramSnapshot is the UNDERLYING 64 KiB RAM
+            // (SystemRAMBank::peek -> raw ram[], banking-independent), so the bytes a
+            // player loads INTO the RAM banked under I/O ($d000-$dfff) / KERNAL
+            // ($e000-$ffff) are captured verbatim regardless of the live bank state.
+            // We therefore no longer cap at $d000: a player whose song data lives at
+            // e.g. $e800 (MoN_Deenen) or $f000 (Stephen_Ruddy) is now snapshot-able.
+            // This stays ADDITIVE -- both eligibility classes below are bounded to the
+            // loaded image span [loadLo, loadHi) (class 1 fully, class 2 except zero
+            // page), so an image loaded entirely < $d000 admits NOTHING new up here.
+            if (a < 0x0002) return false;                  // RAM only
             const uint8_t b = tr.acc[a];
             const bool writePlay = b & libsidplayfp::ACC_WRITE_PLAY;
             const bool readPlay  = b & libsidplayfp::ACC_READ_PLAY;

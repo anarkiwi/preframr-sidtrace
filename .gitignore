@@ -1,5 +1,6 @@
 # build output
 /build/
+/build-snap/
 
 # Makefile stamps inside the submodule (the submodule tree is patched/built
 # in place; these mark applied-patch / configured state)
