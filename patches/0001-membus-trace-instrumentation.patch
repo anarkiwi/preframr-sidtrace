@@ -1995,3 +1995,91 @@ index 00000000..44d7c7b6
 +} // namespace libsidplayfp
 +
 +#endif // MEMBUS_TRACE_H
+diff --git a/src/builders/sidlite-builder/sidlite-emu.cpp b/src/builders/sidlite-builder/sidlite-emu.cpp
+index ac7916da..37aa2411 100644
+--- a/src/builders/sidlite-builder/sidlite-emu.cpp
++++ b/src/builders/sidlite-builder/sidlite-emu.cpp
+@@ -81,7 +81,16 @@ void SIDLiteEmu::clock()
+ {
+     const event_clock_t cycles = eventScheduler->getTime(EVENT_CLOCK_PHI1) - m_accessClk;
+     m_accessClk += cycles;
+-    m_bufferpos += m_sid.clock(cycles, m_buffer+m_bufferpos);
++    // Cap rendering to the space left in m_buffer. The host (Player::play) drains
++    // the buffer once per play() chunk; a tune that performs very many SID-register
++    // accesses within one chunk (each calling clock()) can otherwise accumulate
++    // more than the 20ms buffer holds and overrun it. m_accessClk is advanced by
++    // the full cycle count above regardless, so the SID register access cadence
++    // (and thus the bus trace) is unaffected; only the discarded audio is clipped.
++    const int space = m_buffersize - m_bufferpos;
++    if (space <= 0)
++        return;
++    m_bufferpos += m_sid.clock(cycles, m_buffer+m_bufferpos, space);
+ }
+ 
+ int SIDLiteEmu::getLevel() const
+@@ -125,6 +134,7 @@ void SIDLiteEmu::sampling(float systemclock, float freq,
+     // 20ms buffer
+     const int buffersize = std::ceil((freq / 1000.f) * 20.f);
+     m_buffer = new short[buffersize];
++    m_buffersize = buffersize;   // remembered so clock() can bound writes
+     m_status = true;
+ }
+ 
+diff --git a/src/builders/sidlite-builder/sidlite-emu.h b/src/builders/sidlite-builder/sidlite-emu.h
+index c1056d45..1f89e0f0 100644
+--- a/src/builders/sidlite-builder/sidlite-emu.h
++++ b/src/builders/sidlite-builder/sidlite-emu.h
+@@ -43,6 +43,12 @@ class SIDLiteEmu final : public sidemu
+ private:
+     SIDLite::SID &m_sid;
+ 
++    // Capacity (in samples) of the inherited m_buffer, remembered from the last
++    // sampling() call so clock() can cap rendering to the remaining space and
++    // never write past the allocation (the m_buffer overrun that surfaced as a
++    // teardown "double free or corruption" on a densely-polling RSID).
++    int m_buffersize = 0;
++
+ public:
+     static const char* getCredits();
+ 
+diff --git a/src/builders/sidlite-builder/sidlite/SID.cpp b/src/builders/sidlite-builder/sidlite/SID.cpp
+index fed8b2fc..5366af31 100644
+--- a/src/builders/sidlite-builder/sidlite/SID.cpp
++++ b/src/builders/sidlite-builder/sidlite/SID.cpp
+@@ -34,10 +34,15 @@
+ namespace SIDLite
+ {
+ 
+-int SID::clock(unsigned int cycles, short* buf)
++int SID::clock(unsigned int cycles, short* buf, int maxSamples)
+ {
+     int i = 0;
+-    while (cycles > 0)
++    // Stop once the caller's buffer is full: writing buf[i] for i >= maxSamples
++    // would run past the allocation and corrupt the heap. The remaining cycles
++    // are simply not rendered this call -- harmless, because the only consumer is
++    // the discarded audio mixdown; the SID register bus trace (the recovery
++    // artifact) is independent of these samples.
++    while (cycles > 0 && i < maxSamples)
+     {
+         short output;
+         if (generateSample(cycles, output))
+diff --git a/src/builders/sidlite-builder/sidlite/SID.h b/src/builders/sidlite-builder/sidlite/SID.h
+index 05254e00..ef111d71 100644
+--- a/src/builders/sidlite-builder/sidlite/SID.h
++++ b/src/builders/sidlite-builder/sidlite/SID.h
+@@ -49,6 +49,14 @@ public:
+     int read(int addr) const;
+     int clock(unsigned int cycles, short* buf);
+ 
++    // Render up to `cycles` worth of samples into `buf`, but never write more
++    // than `maxSamples` elements (the remaining capacity of the caller's buffer).
++    // Returns the number of samples written. The cap prevents a heap overflow
++    // when the caller accumulates many SID accesses between buffer drains (a
++    // self-installed-IRQ RSID whose generator polls/writes SID registers densely
++    // within one Player::play() chunk would otherwise overrun the 20ms buffer).
++    int clock(unsigned int cycles, short* buf, int maxSamples);
++
+     void setChipModel(model_t model);
+     void setRealSIDmode(bool mode);
+     bool setSamplingParameters(unsigned int clockFrequency, unsigned short samplingFrequency);
