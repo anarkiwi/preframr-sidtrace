@@ -63,6 +63,16 @@ _SIDDF_LEAF = struct.Struct("<BxHBx")  # kind u8, pad, addr u16, value u8, pad
 #  addr u16, flags u8, pad, totalFrames u32, firstSeenFrame u32, nSamples u16
 _STSQ_HEAD = struct.Struct("<HBxIIH")
 
+# Recovery-offload sections (the structural-capture additions; appended after
+# SDCU so the sections above stay byte-identical).
+_IDXS_ENTRY = struct.Struct("<HBBiHIBBHH")
+_PWLK_HEAD = struct.Struct("<HBBBBIH")
+_RELO_ENTRY = struct.Struct("<HHHHiiBBHI")
+_SDAC_HEAD = struct.Struct("<HBBH")
+_SDAC_ADDEND = struct.Struct("<BH")
+_DIGI_REC = struct.Struct("<IIBBBBII")
+_TMPO_ENTRY = struct.Struct("<HBB")
+
 # Leaf kinds (mirror membus_trace.h LeafKind).
 LK_IMMEDIATE = 0
 LK_RAM_READ = 1
@@ -78,11 +88,35 @@ LEAF_KIND_NAME = {
 }
 
 # ALU ops (mirror membus_trace.h AluOp).
-(ALU_NONE, ALU_ADC, ALU_SBC, ALU_AND, ALU_ORA, ALU_EOR, ALU_ASL, ALU_LSR,
- ALU_ROL, ALU_ROR, ALU_INC, ALU_DEC, ALU_CMP) = range(13)
+(
+    ALU_NONE,
+    ALU_ADC,
+    ALU_SBC,
+    ALU_AND,
+    ALU_ORA,
+    ALU_EOR,
+    ALU_ASL,
+    ALU_LSR,
+    ALU_ROL,
+    ALU_ROR,
+    ALU_INC,
+    ALU_DEC,
+    ALU_CMP,
+) = range(13)
 ALU_NAME = {
-    0: "NONE", 1: "ADC", 2: "SBC", 3: "AND", 4: "ORA", 5: "EOR",
-    6: "ASL", 7: "LSR", 8: "ROL", 9: "ROR", 10: "INC", 11: "DEC", 12: "CMP",
+    0: "NONE",
+    1: "ADC",
+    2: "SBC",
+    3: "AND",
+    4: "ORA",
+    5: "EOR",
+    6: "ASL",
+    7: "LSR",
+    8: "ROL",
+    9: "ROR",
+    10: "INC",
+    11: "DEC",
+    12: "CMP",
 }
 
 
@@ -120,6 +154,12 @@ def parse_sdst(path):
     siddf = []
     stateseq = []
     sdcu = []
+    idx_supp = []
+    ptr_walks = []
+    relo_copies = []
+    sid_accum = []
+    digi = None
+    tempo_cands = []
     while off < len(buf):
         tag = buf[off : off + 4]
         off += 4
@@ -170,8 +210,17 @@ def parse_sdst(path):
             dest = siddf if tag == b"SDDF" else sdcu
             for _ in range(nent):
                 (
-                    pc, reg, flags, count, vlo, vhi, vfirst,
-                    sbase, sstep, simin, simax,
+                    pc,
+                    reg,
+                    flags,
+                    count,
+                    vlo,
+                    vhi,
+                    vfirst,
+                    sbase,
+                    sstep,
+                    simin,
+                    simax,
                 ) = _SIDDF_HEAD.unpack_from(buf, off)
                 off += _SIDDF_HEAD.size
                 (npcs,) = struct.unpack_from("<H", buf, off)
@@ -198,13 +247,22 @@ def parse_sdst(path):
                 off += nval
                 dest.append(
                     {
-                        "pc": pc, "reg": reg, "flags": flags, "count": count,
-                        "val_lo": vlo, "val_hi": vhi, "val_first": vfirst,
+                        "pc": pc,
+                        "reg": reg,
+                        "flags": flags,
+                        "count": count,
+                        "val_lo": vlo,
+                        "val_hi": vhi,
+                        "val_first": vfirst,
                         "has_stride": bool(flags & 1),
                         "any_out_of_window": bool(flags & 2),
-                        "stride_base": sbase, "stride_step": sstep,
-                        "stride_idx_min": simin, "stride_idx_max": simax,
-                        "slice_pcs": pcs, "leaves": leaves, "op_seq": ops,
+                        "stride_base": sbase,
+                        "stride_step": sstep,
+                        "stride_idx_min": simin,
+                        "stride_idx_max": simax,
+                        "slice_pcs": pcs,
+                        "leaves": leaves,
+                        "op_seq": ops,
                         "val_seq": valseq,
                     }
                 )
@@ -229,6 +287,105 @@ def parse_sdst(path):
                         "samples": samples,
                     }
                 )
+        elif tag == b"IDXS":
+            (nent,) = struct.unpack_from("<I", buf, off)
+            off += 4
+            for _ in range(nent):
+                pc, flags, nsamp, scale, basefit, mask, s0i, s1i, s0a, s1a = (
+                    _IDXS_ENTRY.unpack_from(buf, off)
+                )
+                off += _IDXS_ENTRY.size
+                idx_supp.append(
+                    {
+                        "pc": pc,
+                        "scale_set": bool(flags & 1),
+                        "targets_in_image": bool(flags & 2),
+                        "targets_read_as_data": bool(flags & 4),
+                        "n_samp": nsamp,
+                        "scale": scale,
+                        "base_fit": basefit,
+                        "feeds_reg_mask": mask,
+                        "samp_idx": (s0i, s1i),
+                        "samp_addr": (s0a, s1a),
+                    }
+                )
+        elif tag == b"PWLK":
+            (nent,) = struct.unpack_from("<I", buf, off)
+            off += 4
+            for _ in range(nent):
+                zp, flags, ymin, ymax, _p, count, nadv = _PWLK_HEAD.unpack_from(
+                    buf, off
+                )
+                off += _PWLK_HEAD.size
+                ptrs = list(struct.unpack_from(f"<{nadv}H", buf, off))
+                off += 2 * nadv
+                frames = list(struct.unpack_from(f"<{nadv}I", buf, off))
+                off += 4 * nadv
+                ptr_walks.append(
+                    {
+                        "zp": zp,
+                        "is_load": bool(flags & 1),
+                        "is_store": bool(flags & 2),
+                        "y_min": ymin,
+                        "y_max": ymax,
+                        "count": count,
+                        "ptr_vals": ptrs,
+                        "adv_frames": frames,
+                    }
+                )
+        elif tag == b"RELO":
+            (nent,) = struct.unpack_from("<I", buf, off)
+            off += 4
+            for _ in range(nent):
+                spc, srpc, sb, db, ss, ds, imin, imax, _p, count = (
+                    _RELO_ENTRY.unpack_from(buf, off)
+                )
+                off += _RELO_ENTRY.size
+                relo_copies.append(
+                    {
+                        "store_pc": spc,
+                        "src_read_pc": srpc,
+                        "src_base": sb,
+                        "dst_base": db,
+                        "src_stride": ss,
+                        "dst_stride": ds,
+                        "idx_min": imin,
+                        "idx_max": imax,
+                        "count": count,
+                        "delta": (db - sb) & 0xFFFF,
+                    }
+                )
+        elif tag == b"SDAC":
+            (nent,) = struct.unpack_from("<I", buf, off)
+            off += 4
+            for _ in range(nent):
+                pc, reg, _p, nadd = _SDAC_HEAD.unpack_from(buf, off)
+                off += _SDAC_HEAD.size
+                addends = []
+                for _ in range(nadd):
+                    op, cell = _SDAC_ADDEND.unpack_from(buf, off)
+                    off += _SDAC_ADDEND.size
+                    addends.append((op, cell))
+                sid_accum.append({"pc": pc, "reg": reg, "addends": addends})
+        elif tag == b"DIGI":
+            mean1k, maxd418, notetbl, _p0, _p1, _p2, fc, nwr = _DIGI_REC.unpack_from(
+                buf, off
+            )
+            off += _DIGI_REC.size
+            digi = {
+                "writes_per_frame_mean": mean1k / 1000.0,
+                "max_subframe_d418": maxd418,
+                "note_table_idxr_present": bool(notetbl),
+                "n_frames": fc,
+                "n_sid_writes": nwr,
+            }
+        elif tag == b"TMPO":
+            (ncand,) = struct.unpack_from("<H", buf, off)
+            off += 2
+            for _ in range(ncand):
+                cell, reload, _p = _TMPO_ENTRY.unpack_from(buf, off)
+                off += _TMPO_ENTRY.size
+                tempo_cands.append({"cell": cell, "reload": reload})
         else:
             raise ValueError(f"unknown SDST section {tag!r}")
 
@@ -249,6 +406,12 @@ def parse_sdst(path):
         "siddf": siddf,
         "stateseq": stateseq,
         "sdcu": sdcu,
+        "idx_supp": idx_supp,
+        "ptr_walks": ptr_walks,
+        "relo_copies": relo_copies,
+        "sid_accum": sid_accum,
+        "digi": digi,
+        "tempo_cands": tempo_cands,
     }
 
 

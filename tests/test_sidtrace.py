@@ -220,9 +220,9 @@ def test_siddf_classifies_state_vs_constant(trace):
 
     fr = by_reg[0x00]  # freq-lo, fed by the INC'd counter
     leaf_kinds = {k for k, _a, _v in fr["leaves"]}
-    assert LK_STATE_CELL in leaf_kinds, (
-        "freq-lo's counter source must classify as state_cell, not constant"
-    )
+    assert (
+        LK_STATE_CELL in leaf_kinds
+    ), "freq-lo's counter source must classify as state_cell, not constant"
     # the counter is genuinely mutable -> the written value is not constant
     assert fr["val_lo"] != fr["val_hi"]
 
@@ -261,9 +261,9 @@ def test_siddf_flat_vs_capture_length(tmp_path, fixture_sid):
     sw_short = load_sidwr(Path(str(short).replace(".distill.bin", ".sidwr.bin")))
     sw_long = load_sidwr(Path(str(long).replace(".distill.bin", ".sidwr.bin")))
     assert sw_long.size > sw_short.size * 5, "long capture should have many more writes"
-    assert siddf_nbytes(short) == siddf_nbytes(long), (
-        "SIDDF size grew with capture length -- it must be O(code sites), not O(frames)"
-    )
+    assert siddf_nbytes(short) == siddf_nbytes(
+        long
+    ), "SIDDF size grew with capture length -- it must be O(code sites), not O(frames)"
 
 
 def test_stateseq_present_for_flagged_state_cells(trace):
@@ -322,9 +322,9 @@ def test_stateseq_bounded_and_flat_vs_capture_length(tmp_path, fixture_sid):
     sw_a = load_sidwr(Path(str(a).replace(".distill.bin", ".sidwr.bin")))
     sw_b = load_sidwr(Path(str(b).replace(".distill.bin", ".sidwr.bin")))
     assert sw_b.size > sw_a.size, "longer capture should have more SID writes"
-    assert stsq_nbytes(a) == stsq_nbytes(b), (
-        "STATESEQ size grew with capture length -- it must be O(state cells * M)"
-    )
+    assert stsq_nbytes(a) == stsq_nbytes(
+        b
+    ), "STATESEQ size grew with capture length -- it must be O(state cells * M)"
     # and the per-cell sample count is capped at M=512.
     d = parse_sdst(b)
     assert all(e["n_samples"] <= 512 for e in d["stateseq"])
@@ -342,19 +342,19 @@ def test_sdcu_present_for_state_cell_update(trace):
     siddf_state = {
         a for e in d["siddf"] for k, a, _v in e["leaves"] if k == LK_STATE_CELL
     }
-    sdcu_addrs = {e["pc"] for e in d["sdcu"]}   # pc field holds the cell addr
+    sdcu_addrs = {e["pc"] for e in d["sdcu"]}  # pc field holds the cell addr
     assert sdcu_addrs <= siddf_state, (
         f"SDCU cells {sorted(sdcu_addrs)} must be SIDDF state cells "
         f"{sorted(siddf_state)}"
     )
     # the counter cell's update DAG is the s'=s+1 accumulator: INC + self-leaf.
     counter = next(iter(d["sdcu"]))
-    assert ALU_INC in counter["op_seq"], (
-        f"counter update DAG is not an INC accumulator: ops={counter['op_seq']}"
-    )
-    assert any(a == counter["pc"] for _k, a, _v in counter["leaves"]), (
-        "the accumulator's own cell must be a self-feedback leaf of its update"
-    )
+    assert (
+        ALU_INC in counter["op_seq"]
+    ), f"counter update DAG is not an INC accumulator: ops={counter['op_seq']}"
+    assert any(
+        a == counter["pc"] for _k, a, _v in counter["leaves"]
+    ), "the accumulator's own cell must be a self-feedback leaf of its update"
 
 
 def test_sdcu_carries_midcall_valseq(trace):
@@ -374,6 +374,7 @@ def test_sdcu_carries_midcall_valseq(trace):
     assert any(len(e.get("val_seq", [])) >= 2 for e in d["sdcu"]), (
         "no SDCU cell carried a mid-call value sequence"
     )
+
 
 
 def test_sddf_has_no_valseq(trace):
@@ -544,3 +545,43 @@ def test_smc_operand_artifact_bounded_and_flat(tmp_path, smc_sid):
         )
     for addr in set(a_st) & set(b_st):
         assert a_st[addr] <= 512 and b_st[addr] <= 512, "STATESEQ exceeds the cap"
+
+
+def test_recovery_offload_sections_present_and_parse(trace):
+    """The recovery-offload sections (IDXS/PWLK/RELO/SDAC/DIGI/TMPO) are emitted
+    and parse. They are APPENDED after SDCU, so the parser must reach them, and
+    the DIGI density record is always present (a fixed single record)."""
+    d = parse_sdst(trace["distill"])
+    # the fixture loads $D400 from an INC'd counter via an absolute index; IDXS
+    # mirrors every IDXR entry (same count) so the supplement is one-to-one.
+    assert len(d["idx_supp"]) == len(
+        d["idx_reads"]
+    ), "IDXS must carry one supplement per IDXR entry"
+    # DIGI is a single fixed record, always emitted; the fixture is a tracker-like
+    # writer (a handful of writes/frame), NOT a PCM digi.
+    assert d["digi"] is not None, "DIGI density record missing"
+    assert d["digi"]["n_sid_writes"] == load_sidwr(trace["sidwr"]).size
+    assert d["digi"]["max_subframe_d418"] < 16, "fixture is not a digi"
+    # the offload lists exist (possibly empty -- the simple fixture has no
+    # (zp),Y orderlist walk nor an init block-copy); the keys must be present.
+    for key in ("ptr_walks", "relo_copies", "sid_accum", "tempo_cands"):
+        assert key in d, f"missing recovery-offload list {key!r}"
+
+
+def test_idxs_affine_fit_is_consistent(trace):
+    """Where the IDXS scaled-index fit is set, base_fit + scale*idx must equal the
+    observed sample address (the affine fit is exact, never an approximation).
+
+    The minimal fixture's indexed reads may not exercise a 2-distinct-index table,
+    so ``scale_set`` can be empty here -- the invariant is checked for every entry
+    that DOES carry a fit (the HVSC anchors exercise the populated case). A set fit
+    must always satisfy the affine relation, and an UNSET fit must default to the
+    legacy single-sample base (scale 1)."""
+    d = parse_sdst(trace["distill"])
+    for s in d["idx_supp"]:
+        if s["scale_set"]:
+            (i0, i1), (a0, a1) = s["samp_idx"], s["samp_addr"]
+            assert (s["base_fit"] + s["scale"] * i0) & 0xFFFF == a0
+            assert (s["base_fit"] + s["scale"] * i1) & 0xFFFF == a1
+        else:
+            assert s["scale"] == 1, "unset fit must default to legacy scale 1"

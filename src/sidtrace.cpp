@@ -447,6 +447,199 @@ static long emit_distill(const char *path, MemBusTrace &tr,
         fseek(f, end, SEEK_SET);
     }
 
+    // ===================================================================
+    // Recovery-offload sections (additive; the existing sections above are
+    // byte-identical to the pre-change emitter). Each is a self-describing
+    // tagged section the host parses additively; older readers skip them.
+    // ===================================================================
+
+    // IDXS: IDXR SUPPLEMENT (item #1 scaled-index fit + item #5 reg attribution).
+    // One entry per IDXR PC (same key, same order as the IDXR section): the two
+    // observed (idxVal, effAddr) samples, the fitted scale/base, the feedsRegMask
+    // (bit r set => this table's values reach $D4(r)), and the pointer-table
+    // signals (targetsInImage / targetsReadAsData). Layout: tag "IDXS"; nentries
+    // u32; then per entry:
+    //   pc u16, flags u8 (bit0=scaleSet, bit1=targetsInImage,
+    //                     bit2=targetsReadAsData), nSamp u8,
+    //   scale i32, baseFit u16, feedsRegMask u32,
+    //   samp0Idx u8, samp1Idx u8, samp0Addr u16, samp1Addr u16.
+    {
+        fwrite("IDXS", 1, 4, f);
+        wr_u32(f, (uint32_t)tr.idxReads.size());
+        for (const auto &kv : tr.idxReads)
+        {
+            const libsidplayfp::IdxSummary &s = kv.second;
+            uint8_t flags = 0;
+            if (s.scaleSet)          flags |= 0x01;
+            if (s.targetsInImage)    flags |= 0x02;
+            if (s.targetsReadAsData) flags |= 0x04;
+            wr_u16(f, kv.first);             // pc
+            wr_u8(f, flags);
+            wr_u8(f, s.nSamp);
+            wr_i32(f, s.scale);
+            wr_u16(f, s.baseFit);
+            wr_u32(f, s.feedsRegMask);
+            wr_u8(f, s.sampIdx[0]);
+            wr_u8(f, s.sampIdx[1]);
+            wr_u16(f, s.sampAddr[0]);
+            wr_u16(f, s.sampAddr[1]);
+        }
+    }
+
+    // PWLK: (zp),Y pointer-walk sequences (item #2 + the item #6 row-advance
+    // frames). One entry per zp pointer-pair. The pointer-VALUE sequence (dedup
+    // consecutive equals -> advances) is the resolved orderlist->pattern stream;
+    // advFrame[i] is the frame (play-call) index of advance i (the row/note
+    // onset = item #6 tempo events); yMin/yMax is the per-call index range.
+    // Layout: tag "PWLK"; nentries u32; then per entry:
+    //   zp u16, flags u8 (bit0=isLoad, bit1=isStore), yMin u8, yMax u8, _pad u8,
+    //   count u32, nAdv u16, then nAdv * (ptrVal u16), then nAdv * (advFrame u32).
+    {
+        fwrite("PWLK", 1, 4, f);
+        wr_u32(f, (uint32_t)tr.ptrWalks.size());
+        for (const auto &kv : tr.ptrWalks)
+        {
+            const libsidplayfp::PtrWalkCell &c = kv.second;
+            uint8_t flags = 0;
+            if (c.isLoad)  flags |= 0x01;
+            if (c.isStore) flags |= 0x02;
+            wr_u16(f, kv.first);             // zp pair address
+            wr_u8(f, flags);
+            wr_u8(f, c.yMin == 0xff ? 0 : c.yMin);
+            wr_u8(f, c.yMax);
+            wr_u8(f, 0);
+            wr_u32(f, (uint32_t)c.count);
+            wr_u16(f, (uint16_t)c.nAdv);
+            for (uint32_t i = 0; i < c.nAdv; ++i) wr_u16(f, c.ptrVals[i]);
+            for (uint32_t i = 0; i < c.nAdv; ++i) wr_u32(f, c.advFrame[i]);
+        }
+    }
+
+    // RELO: init block-copy summaries (item #3). One entry per init store PC that
+    // copied an indexed table to a runtime base. delta = dstBase - srcBase.
+    // Layout: tag "RELO"; nentries u32; then per entry:
+    //   storePc u16, srcReadPc u16, srcBase u16, dstBase u16,
+    //   srcStride i32, dstStride i32, idxMin u8, idxMax u8, _pad u16, count u32.
+    {
+        fwrite("RELO", 1, 4, f);
+        wr_u32(f, (uint32_t)tr.reloCopies.size());
+        for (const auto &kv : tr.reloCopies)
+        {
+            const libsidplayfp::ReloCopy &r = kv.second;
+            wr_u16(f, kv.first);             // store PC
+            wr_u16(f, r.srcReadPc);
+            wr_u16(f, r.srcBase);
+            wr_u16(f, r.dstBase);
+            wr_i32(f, r.srcStride);
+            wr_i32(f, r.dstStride);
+            wr_u8(f, r.idxMin == 0xff ? 0 : r.idxMin);
+            wr_u8(f, r.idxMax);
+            wr_u16(f, 0);
+            wr_u32(f, (uint32_t)r.count);
+        }
+    }
+
+    // SDAC: SIDDF ACCUMULATED supplement (item #7). Only the SIDDF sites tagged
+    // accumulated are emitted (a write whose source shadow is written >=2x per
+    // play-call by distinct PCs: freq = base (+) vib_acc (+) porta_acc). Layout:
+    // tag "SDAC"; nentries u32; then per entry:
+    //   pc u16, reg u8, _pad u8, nAddends u16, then nAddends * (op u8, cell u16).
+    {
+        fwrite("SDAC", 1, 4, f);
+        long nentPos = ftell(f);
+        wr_u32(f, 0);
+        uint32_t nent = 0;
+        for (const auto &kv : tr.siddf)
+        {
+            const libsidplayfp::SiddfSummary &s = kv.second;
+            if (!s.accumulated) continue;
+            const uint16_t pc = (uint16_t)(kv.first >> 5);
+            const uint8_t reg = (uint8_t)(kv.first & 0x1f);
+            wr_u16(f, pc);
+            wr_u8(f, reg);
+            wr_u8(f, 0);
+            wr_u16(f, (uint16_t)s.addends.size());
+            for (const auto &ad : s.addends) { wr_u8(f, ad.op); wr_u16(f, ad.cell); }
+            nent++;
+        }
+        long end = ftell(f);
+        fseek(f, nentPos, SEEK_SET);
+        wr_u32(f, nent);
+        fseek(f, end, SEEK_SET);
+    }
+
+    // DIGI: header-density signature (item #4). Single fixed record: the mean
+    // SID writes per frame, the max sub-frame $D418 writes in any one play-call,
+    // and whether ANY IDXR table feeds a freq register (a note table => tracker,
+    // not a PCM streamer). A digi = hundreds of $D418 writes/frame, no note-table
+    // IDXR. Layout: tag "DIGI"; then:
+    //   writes_per_frame_mean_x1000 u32 (mean*1000 fixed-point),
+    //   max_subframe_d418 u32, note_table_idxr_present u8, _pad u8[3],
+    //   n_frames u32, n_sid_writes u32.
+    {
+        fwrite("DIGI", 1, 4, f);
+        const uint64_t nWr = (uint64_t)tr.sidStream.size();
+        // frame count: the play-call boundaries the detector crossed (frameNo).
+        // Fall back to the requested nframes if no boundary was seen.
+        const uint32_t fc = tr.frameNo ? tr.frameNo : (uint32_t)nframes;
+        const uint64_t meanX1000 = fc ? (nWr * 1000ull) / fc : 0;
+        // note_table_idxr_present: any IDXR feeding a freq lo/hi reg (0,1 / 7,8 /
+        // 14,15) AND swept ~an octave-table's worth of entries (length >= 24) --
+        // the 12-TET note table the freq write indexes. (A coincidental single
+        // freq-fed read of a 1-entry constant is excluded by the length floor.)
+        const uint32_t freqMask = (1u<<0)|(1u<<1)|(1u<<7)|(1u<<8)|(1u<<14)|(1u<<15);
+        bool noteTbl = false;
+        for (const auto &kv : tr.idxReads)
+        {
+            const libsidplayfp::IdxSummary &s = kv.second;
+            const int len = (int)s.idxMax - (int)(s.idxMin == 0xff ? 0 : s.idxMin) + 1;
+            if ((s.feedsRegMask & freqMask) && len >= 24) { noteTbl = true; break; }
+        }
+        wr_u32(f, (uint32_t)(meanX1000 > 0xffffffffull ? 0xffffffffull : meanX1000));
+        wr_u32(f, tr.maxFrameD418);
+        wr_u8(f, noteTbl ? 1 : 0);
+        wr_u8(f, 0); wr_u8(f, 0); wr_u8(f, 0);
+        wr_u32(f, fc);
+        wr_u32(f, (uint32_t)(nWr > 0xffffffffull ? 0xffffffffull : nWr));
+    }
+
+    // TMPO: tempo events (item #6). The frame-divider reload constant is the
+    // immediate feeding the divider counter cell -- an SDCU LK_IMMEDIATE leaf on
+    // a state cell whose update op is DEC (the `DEC counter; BNE; reload const`
+    // idiom). We surface the candidate reload immediates (the host picks the row
+    // divider). The per-row advance frames are in PWLK (advFrame). Layout: tag
+    // "TMPO"; nCand u16, then nCand * (cell u16, reload u8, _pad u8).
+    {
+        fwrite("TMPO", 1, 4, f);
+        long nPos = ftell(f);
+        wr_u16(f, 0);
+        uint16_t ncand = 0;
+        for (const auto &kv : tr.sdcu)
+        {
+            const libsidplayfp::SiddfSummary &s = kv.second;
+            if (!tr.isSiddfStateCell(kv.first)) continue;
+            // a frame-divider cell decrements (DEC in op_seq) and reloads from an
+            // immediate (an LK_IMMEDIATE leaf) -- the reload constant.
+            bool hasDec = false;
+            for (uint8_t op : s.opSeq)
+                if (op == libsidplayfp::ALU_DEC) { hasDec = true; break; }
+            if (!hasDec) continue;
+            for (const auto &l : s.leaves)
+                if (l.kind == libsidplayfp::LK_IMMEDIATE)
+                {
+                    wr_u16(f, kv.first);     // divider cell address
+                    wr_u8(f, l.value);       // reload immediate
+                    wr_u8(f, 0);
+                    ncand++;
+                    break;
+                }
+        }
+        long end = ftell(f);
+        fseek(f, nPos, SEEK_SET);
+        wr_u16(f, ncand);
+        fseek(f, end, SEEK_SET);
+    }
+
     fwrite("END\0", 1, 4, f);
     long sz = ftell(f);
     fclose(f);
@@ -617,6 +810,16 @@ int main(int argc, char **argv)
     // cell first read on frame 1 before its play-write would otherwise look
     // read-only). Deterministic: depends only on the accumulated acc map.
     tr.finalizeLeaves();
+
+    // Finalize the recovery-offload captures (IDXR scale fit + pointer-table
+    // target signals + SIDDF accumulated tagging). Deterministic; depends only on
+    // the accumulated state. Bound the loaded image span for the in-image signal.
+    {
+        const uint16_t loadLo = ti ? (uint16_t)ti->loadAddr() : 0;
+        const uint32_t loadHiU = ti ? ((uint32_t)loadLo + ti->c64dataLen()) : 0x10000;
+        const uint16_t loadHi = (uint16_t)(loadHiU > 0xffff ? 0xffff : loadHiU);
+        tr.finalizeOffload(loadLo, loadHi);
+    }
 
     // --- emit the compact distilled artifact (SDST) ---
     const long distillBytes =

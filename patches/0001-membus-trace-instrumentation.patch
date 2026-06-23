@@ -166,10 +166,10 @@ index 691ab7f8..e82f4a3b 100644
          if (addr >= 0x0400 && addr <= 0x07ff)
 diff --git a/src/c64/membus_trace.h b/src/c64/membus_trace.h
 new file mode 100644
-index 00000000..11ca6128
+index 00000000..44d7c7b6
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,1357 @@
+@@ -0,0 +1,1825 @@
 +/*
 + * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
 + * Not part of upstream libsidplayfp. Scratch use only.
@@ -293,6 +293,81 @@ index 00000000..11ca6128
 +    uint8_t  idxMin = 0xff;
 +    uint8_t  idxMax = 0;
 +    bool     baseSet = false;
++
++    // --- SCALED-INDEX fit (recovery-offload item #1) ----------------------
++    // The single-sample `base = effAddr - idx` is only correct when the table
++    // stride matches the index step. For a `LDA tbl,Y` whose Y is pre-scaled
++    // (Y = note*2 into a stride-2 interleaved table) the recovered base is
++    // garbled. We record up to two DISTINCT-index observed (idxVal, effAddr)
++    // samples USING THE OPCODE'S ACTUAL INDEX REGISTER (not max(x,y), which
++    // mis-attributes the base when the other index reg happens to be larger),
++    // so the host can fit  scale = (a1-a0)/(i1-i0),  base = a0 - scale*i0
++    // and read the interleaved note/pointer table at the right stride. Two
++    // samples with distinct idx are sufficient for the affine fit; idxSamples
++    // holds them and scaleSet flags a valid fit.
++    uint8_t  sampIdx[2] = {0, 0};
++    uint16_t sampAddr[2] = {0, 0};
++    uint8_t  nSamp = 0;
++    bool     scaleSet = false;
++    int32_t  scale = 1;       // fitted bytes-per-index step (0 if not fittable)
++    uint16_t baseFit = 0;     // fitted base = sampAddr[0] - scale*sampIdx[0]
++
++    // --- feedsRegMask (recovery-offload item #5) --------------------------
++    // Which SID $D4xx register(s) this table's values ultimately feed (a bit
++    // per reg 0..24). Propagated from the SIDDF SID-write slicer when a slice
++    // reaches this PC's indexed read as a leaf (the freq/instrument/etc. lane
++    // attribution the slice machinery already holds). Plus two table-class
++    // signals: targetsInImage (the 16-bit values formed at base+idx are
++    // themselves in-image addresses -> a pointer table) and targetsReadAsData
++    // (those target addresses were READ AS DATA during play -> a live pointer
++    // table the player dereferenced). Both default false; set at finalize.
++    uint32_t feedsRegMask = 0;
++    bool     targetsInImage = false;
++    bool     targetsReadAsData = false;
++};
++
++// --- PWLK ((zp),Y pointer-walk capture; recovery-offload item #2) ----------
++// A `(zp),Y` indirect-indexed access (opcodes 0xB1 load / 0x91 store) reads its
++// 16-bit pointer live from the zero-page pair `ram(zp) | ram(zp+1)<<8`. The
++// SEQUENCE of distinct pointer values this zp-pair takes across the run IS the
++// resolved orderlist->pattern stream (each new pointer = a pattern start the
++// orderlist advanced to); the Y index range per pointer is the row span walked;
++// the frame index of each advance is a note/row onset. Keyed by the zp-pair base
++// address. Dedup consecutive-equal pointer values into ADVANCE events; bounded
++// to PWLK_CAP advances per pair, flat vs run length.
++struct PtrWalkCell
++{
++    static constexpr uint32_t PW_CAP = 256;   // bounded advance events per pair
++    uint16_t ptrVals[PW_CAP];                 // distinct consecutive pointer values
++    uint32_t advFrame[PW_CAP];                // frame (play-call) index of each advance
++    uint32_t nAdv = 0;                        // number of advance events recorded
++    uint64_t count = 0;                       // total (zp),Y accesses on this pair
++    uint8_t  yMin = 0xff, yMax = 0;           // Y index range across all accesses
++    uint16_t lastPtr = 0;                     // most recent pointer value
++    bool     haveLast = false;
++    bool     isLoad = false;                  // saw a load (0xB1) on this pair
++    bool     isStore = false;                 // saw a store (0x91) on this pair
++};
++
++// --- RELO (init block-copy capture; recovery-offload item #3) --------------
++// During PHASE_INIT a `LDA src,Y / STA dst,Y` (or stride-2 interleaved) copy
++// loop relocates a table to its runtime base. Each init STORE that is an indexed
++// write whose value came from an indexed read is one such copy; we accumulate
++// per init store-PC the (src_base, dst_base, length, src_stride, dst_stride,
++// count). delta = dst_base - src_base is the relocation offset the recovery
++// needs to read image-relative tables. Keyed by the store PC. Mirror of the
++// SID-write filler on the WRITE side, restricted to the init phase.
++struct ReloCopy
++{
++    uint64_t count = 0;       // store iterations seen
++    uint16_t srcBase = 0;     // fitted source base (read side, addr - idx)
++    uint16_t dstBase = 0;     // fitted destination base (write side, addr - idx)
++    int32_t  srcStride = 0;   // source element stride (best effort)
++    int32_t  dstStride = 0;   // destination element stride (best effort)
++    uint8_t  idxMin = 0xff, idxMax = 0;       // copy index span -> length
++    uint16_t srcLastAddr = 0, dstLastAddr = 0;
++    bool     srcSet = false, dstSet = false;
++    uint16_t srcReadPc = 0;   // PC of the feeding indexed read (provenance)
 +};
 +
 +// --- SIDDF (per-write data-flow summary) types ---------------------------
@@ -398,6 +473,12 @@ index 00000000..11ca6128
 +    uint8_t  idxUsed = SR_NONE; // index reg (X/Y) used for an indexed data access
 +    uint8_t  regA = 0, regX = 0, regY = 0;   // register file AFTER retirement
 +    uint64_t ringSeq = 0;     // monotone retirement sequence (staleness check)
++    // (zp),Y pointer-pair address: the operand byte of an indirect-indexed access
++    // (the zero-page address of the pointer pair). libsidplayfp reads it via
++    // FetchLowPointer (no recordFetch), so it arrives as the instruction's FIRST
++    // data read (value = the zp address); captured in record() for PWLK (item #2).
++    uint8_t  zpPtr = 0;
++    bool     zpPtrSet = false;
 +};
 +
 +// The accumulated per-(PC,reg) data-flow summary (the SIDDF record).
@@ -426,6 +507,19 @@ index 00000000..11ca6128
 +    // needs to decide LFSR-vs-not. Bounded (SDCU_VALSEQ_M entries), flat vs frames.
 +    static constexpr uint32_t SDCU_VALSEQ_M = 512;
 +    std::vector<uint8_t> valSeq;        // first SDCU_VALSEQ_M update-written values
++
++    // --- ACCUMULATED tag (recovery-offload item #7) -----------------------
++    // The source shadow cell that feeds this $D4xx write is written >=2x per
++    // play-call by DISTINCT PCs (freq = base (+) vib_acc (+) porta_acc). We
++    // detect this per frame: the set of distinct PCs that wrote the leaf state
++    // cell(s) of this slice WITHIN one play-call. If >=2 distinct PCs touched a
++    // contributing cell in a single call, the write is ACCUMULATED -- the host
++    // must model each addend (op, cell) separately rather than treating the
++    // summed output as free pitch. addends holds the contributing (op-of-the-
++    // writing-instruction, cell-address) pairs. Bounded; deduped.
++    bool     accumulated = false;
++    struct Addend { uint8_t op; uint16_t cell; };
++    std::vector<Addend> addends;     // contributing (op, addend-cell) pairs
 +};
 +
 +class MemBusTrace
@@ -497,6 +591,47 @@ index 00000000..11ca6128
 +    // <=STATESEQ_CAP cells * SS_M samples, flat vs run length.
 +    static constexpr uint32_t STATESEQ_CAP = 96;
 +    std::map<uint16_t, StateSeqCell> stateSeq;
++
++    // PWLK: (zp),Y pointer-walk capture, keyed by zp-pair base (recovery item #2).
++    std::map<uint16_t, PtrWalkCell> ptrWalks;
++    // RELO: init block-copy capture, keyed by init store PC (recovery item #3).
++    std::map<uint16_t, ReloCopy> reloCopies;
++
++    // Per-state-cell accumulation tracking (recovery item #7). Within one
++    // play-call we count the distinct PCs that wrote each state cell; >=2 ->
++    // the cell is an ACCUMULATOR (multiple addends per call). We remember, per
++    // cell, the set of writer PCs seen in the CURRENT frame (reset each frame)
++    // plus the op of each contributing writer, and a sticky flag that the cell
++    // was multiply-written in some frame. Keyed by cell address. Bounded to the
++    // SIDDF state cells (a handful).
++    struct AccumTrack
++    {
++        uint16_t framePcs[4] = {0, 0, 0, 0};  // distinct writer PCs this frame
++        uint8_t  frameOps[4] = {0, 0, 0, 0};  // op of each (parallel to framePcs)
++        uint8_t  nFramePcs = 0;
++        uint32_t lastFrame = 0xffffffff;       // frame the set belongs to
++        bool     multiWritten = false;         // >=2 distinct PCs in some frame
++        uint16_t writerPcs[8] = {0};           // union of contributing PCs (multi frames)
++        uint8_t  writerOps[8] = {0};
++        uint8_t  nWriters = 0;
++    };
++    std::map<uint16_t, AccumTrack> accumTrack;
++    // The DIGI / header-density section (recovery item #4) is computed at emit
++    // time from sidStream + the frame-gap detector; no per-frame state needed
++    // here beyond the burst counters the boundary detector already maintains.
++    // Sub-frame $D418 write tracking for the digi signature: the running count
++    // of $D418 writes in the current play-call burst, and the max over all
++    // bursts. A PCM streamer writes $D418 hundreds of times per frame.
++    uint32_t curFrameD418 = 0;
++    uint32_t maxFrameD418 = 0;
++
++    // RELO init-copy detection (item #3): the most recent INDEXED READ retired
++    // during init -- a `LDA src,Y` whose value the next `STA dst,Y` copies. The
++    // ring buffer is play-phase only, so init copy-loop pairing uses this light
++    // last-read latch (a copy loop is LDA src,Y immediately followed by STA dst,Y).
++    bool     initRdValid = false;
++    uint16_t initRdAddr = 0, initRdPc = 0;
++    uint8_t  initRdIdx = 0, initRdVal = 0;
 +    // Frame (play-call) boundary detection: a play-call's SID writes arrive in a
 +    // tight burst (~25 writes within a few hundred cycles) separated by a large
 +    // inter-call gap (~16k-20k cycles). The first SID write after such a gap marks
@@ -609,6 +744,19 @@ index 00000000..11ca6128
 +        // mistaken for state. Zero page, RAM, and SMC operands ARE followed.
 +        if (curValid)
 +        {
++            // (zp),Y / (zp,X) operand capture (PWLK, item #2): libsidplayfp reads
++            // the zp pointer-pair operand byte via FetchLowPointer (NO recordFetch,
++            // so it is not paired as #imm), at PC = opcode_addr + 1. For an
++            // indirect-indexed opcode the read AT THAT ADDRESS is the zp pointer
++            // address; capture it (the first such read only). This does NOT alter
++            // the access map (record() always ran for this read) -- it only stashes
++            // the operand value for the pointer-walk section.
++            if (!rw && !cur.zpPtrSet && cur.gotOpcode &&
++                isIndIndexed(cur.opcode) && addr == (uint16_t)(cur.fetchLo + 1))
++            {
++                cur.zpPtr = val;
++                cur.zpPtrSet = true;
++            }
 +            cur.memAddr = addr;
 +            cur.memVal  = val;
 +            if (rw) cur.memWrite = true; else cur.memRead = true;
@@ -690,6 +838,9 @@ index 00000000..11ca6128
 +                                op == ALU_LSR || op == ALU_ROL || op == ALU_ROR)
 +                                recordCellRmw(ma, op, cur.pc);
 +                        }
++                        // ACCUMULATED (item #7): track distinct writer PCs of this
++                        // cell within the frame; >=2 -> the cell is an accumulator.
++                        recordAccumWrite(ma, cur.pc, aluOp(cur.opcode));
 +                    }
 +                }
 +            }
@@ -700,6 +851,44 @@ index 00000000..11ca6128
 +            // now (its full data-flow context is in the ring buffer below it).
 +            if (cur.memWrite && cur.memAddr >= 0xD400 && cur.memAddr <= 0xD418)
 +                sliceSidWrite(retiredIdx);
++            // PWLK (item #2): a (zp),Y access during play -- the orderlist/pattern
++            // pointer walk. libsidplayfp fetches the zp pointer-pair operand via
++            // FetchLowPointer (no recordFetch), so it is NOT in cur.imm; record()
++            // captures it as the instruction's first data-read VALUE (the operand
++            // byte = the zp address) in cur.zpPtr. Record the live pointer value
++            // sequence + Y span + advance frames (loads 0xB1 + stores 0x91).
++            if (isIndIndexed(cur.opcode) && cur.zpPtrSet &&
++                (cur.memRead || cur.memWrite))
++                recordPtrWalk(cur.zpPtr, cur.idxVal, isStore(cur.opcode));
++        }
++        // RELO (item #3): an init-phase block-copy. The ring buffer is play-only,
++        // so we pair a `LDA src,Y` (latched as the last init indexed read) with the
++        // immediately-following `STA dst,Y` whose stored value matches the read --
++        // the relocation copy loop. delta = dst_base - src_base.
++        else if (curValid && phase == PHASE_INIT && cur.gotOpcode)
++        {
++            const bool isInitStore = isStore(cur.opcode) && cur.memWrite &&
++                cur.idxUsed != SR_NONE &&
++                !(cur.memAddr >= 0xD400 && cur.memAddr <= 0xD7FF);
++            if (isInitStore)
++            {
++                const bool srcMatches = initRdValid && initRdVal == cur.memVal;
++                recordReloCopy(cur.pc, cur.memAddr, cur.idxVal,
++                               srcMatches, initRdAddr, initRdIdx, initRdPc);
++                initRdValid = false;   // consumed
++            }
++            // Latch an indexed READ from RAM (a potential copy source) for the next
++            // store to consume. Only a value-defining indexed read (LDA/LDX/LDY).
++            else if (cur.memRead && cur.idxUsed != SR_NONE &&
++                     defReg(cur.opcode) != SR_NONE && readsMem(cur.opcode) &&
++                     !(cur.memAddr >= 0xD400 && cur.memAddr <= 0xD7FF))
++            {
++                initRdValid = true;
++                initRdAddr = cur.memAddr;
++                initRdIdx = cur.idxVal;
++                initRdVal = cur.memVal;
++                initRdPc = cur.pc;
++            }
 +        }
 +        cur = RetiredInstr{};
 +        cur.pc = startPC;
@@ -728,6 +917,14 @@ index 00000000..11ca6128
 +        siddf.clear();
 +        sdcu.clear();
 +        stateSeq.clear();
++        ptrWalks.clear();
++        reloCopies.clear();
++        accumTrack.clear();
++        curFrameD418 = 0;
++        maxFrameD418 = 0;
++        initRdValid = false;
++        initRdAddr = initRdPc = 0;
++        initRdIdx = initRdVal = 0;
 +        lastSidWriteCycle = -1;
 +        anyFrameStarted = false;
 +        frameNo = 0;
@@ -758,8 +955,14 @@ index 00000000..11ca6128
 +            {
 +                sampleStateCells();
 +                anyFrameStarted = true;
++                // DIGI density (item #4): the prior frame's $D418 burst is done;
++                // fold it into the max and reset. A PCM streamer writes $D418
++                // hundreds of times per frame (sub-frame sample playback).
++                if (curFrameD418 > maxFrameD418) maxFrameD418 = curFrameD418;
++                curFrameD418 = 0;
 +            }
 +            lastSidWriteCycle = t;
++            if ((addr & 0x1f) == 0x18) curFrameD418++;
 +        }
 +        const uint8_t reg = (uint8_t)(addr & 0x1f);
 +        SidWrSummary &s = sidWrites[((uint32_t)pc() << 5) | reg];
@@ -771,11 +974,13 @@ index 00000000..11ca6128
 +    inline void recordIndexedRead(uint16_t addr)
 +    {
 +        // Only summarise reads issued during play (the table walks of interest)
-+        // that came through an index register (effective addr != base => X|Y!=0
-+        // for at least some accesses of this PC). We key by issuing PC and fold
++        // that came through an index register. We key by issuing PC and fold
 +        // base = addr - index, tracking the index span and a stride guess.
 +        if (phase != PHASE_PLAY) return;
 +        const uint8_t x = xreg(), y = yreg();
++        // EXISTING IDXR fields use the legacy dominant index max(x,y) UNCHANGED
++        // (byte-identical to the pre-change emitter; the scaled-index correction
++        // is carried separately in the IDXS supplement, never here).
 +        const uint8_t idx = x >= y ? x : y;   // dominant index; best effort
 +        if (idx == 0)
 +            return;  // non-indexed (or index 0) -- not a table traversal signal
@@ -794,6 +999,173 @@ index 00000000..11ca6128
 +        if (idx < s.idxMin) s.idxMin = idx;
 +        if (idx > s.idxMax) s.idxMax = idx;
 +        s.count++;
++        // SCALED-INDEX samples (item #1): record up to two DISTINCT-index
++        // (idxVal, effAddr) samples USING THE OPCODE'S ACTUAL INDEX REGISTER, so
++        // finalizeOffload can fit scale=(a1-a0)/(i1-i0), base=a0-scale*i0. This
++        // recovers the true base+stride of an interleaved stride-2 (note*2) table
++        // the single-sample base=addr-idx cannot. Kept OUT of the existing fields
++        // above (which stay byte-identical); emitted only in the IDXS section.
++        //
++        // RESTRICT samples to DIRECT (abs/zp),X|Y modes where addr = base +
++        // index_reg is genuinely affine. Indirect (zp),Y reads are addr = ptr + Y
++        // with ptr varying (NOT affine -- those are the PWLK pointer walks), and
++        // would pollute the fit with scale 0/-1.
++        //
++        // CRUCIALLY: recordIndexedRead runs for EVERY read BEFORE the operand-fetch
++        // pairing in record(), so an instruction's own operand-byte reads (at
++        // PC+1/PC+2) reach here with a stale index. Skip those -- a read that pairs
++        // with the just-issued code fetch is an opcode/operand byte, not the
++        // effective indexed data read. (The existing fields above tolerate this
++        // noise and stay byte-identical; only the affine samples must be clean.)
++        if (pendingFetch && addr == pendingFetchAddr) return;
++        if (!(curValid && cur.gotOpcode && isDirectIndexed(cur.opcode)))
++            return;
++        const uint8_t diu = indexRegFor(cur.opcode);
++        const uint8_t sidx = (diu == SR_X) ? x : (diu == SR_Y) ? y : 0;
++        if (sidx == 0) return;   // no meaningful index for the affine sample
++        if (s.nSamp == 0)
++        {
++            s.sampIdx[0] = sidx; s.sampAddr[0] = addr; s.nSamp = 1;
++        }
++        else if (s.nSamp == 1 && sidx != s.sampIdx[0])
++        {
++            s.sampIdx[1] = sidx; s.sampAddr[1] = addr; s.nSamp = 2;
++        }
++    }
++
++    // Is the opcode an indirect-indexed (zp),Y access (the orderlist/pattern
++    // pointer-walk idiom)? 0xB1 = LDA (zp),Y; 0x91 = STA (zp),Y; plus the illegal
++    // LAX (zp),Y 0xB3. The operand byte is the zero-page pointer-pair address.
++    static inline bool isIndIndexed(uint8_t op)
++    {
++        return op == 0xB1 || op == 0x91 || op == 0xB3;
++    }
++
++    // Is the opcode a DIRECT indexed read whose effective address is genuinely
++    // base + index_register (absolute,X|Y or zp,X|Y) -- as opposed to indirect
++    // (zp),Y/(zp,X) where the address is ptr+index with a VARYING pointer? Only
++    // the direct forms yield a clean affine (idx -> addr) sample for the IDXR
++    // scale fit; the indirect forms are pointer walks (PWLK). Reads only (the
++    // value-defining loads / ALU-with-memory we care to attribute as tables).
++    static inline bool isDirectIndexed(uint8_t op)
++    {
++        const uint8_t iu = indexRegFor(op);
++        if (iu == SR_NONE) return false;
++        if (isIndIndexed(op)) return false;          // (zp),Y / LAX (zp),Y
++        switch (op)
++        {
++        // (zp,X) pre-indexed indirect forms -- also pointer-based, not affine.
++        case 0xA1: case 0xC1: case 0xE1: case 0x21: case 0x41: case 0x61:
++        case 0x01: case 0x81:
++            return false;
++        }
++        return true;   // abs,X | abs,Y | zp,X | zp,Y
++    }
++
++    // PWLK (item #2): record a (zp),Y access. `zp` is the zero-page pointer-pair
++    // address (the operand byte); the live pointer value is ram(zp)|ram(zp+1)<<8;
++    // `y` is the index. We dedup consecutive-equal pointer values into ADVANCE
++    // events (a new pointer = the orderlist advanced to a new pattern) and record
++    // the frame index of each advance (the row/note onset). Bounded per pair.
++    inline void recordPtrWalk(uint16_t zp, uint8_t y, bool isStore)
++    {
++        if (!ramFn) return;
++        const uint16_t ptr = (uint16_t)(ramFn(ramCtx, zp) |
++                                        (ramFn(ramCtx, (uint16_t)(zp + 1)) << 8));
++        PtrWalkCell &c = ptrWalks[zp];
++        c.count++;
++        if (isStore) c.isStore = true; else c.isLoad = true;
++        if (y < c.yMin) c.yMin = y;
++        if (y > c.yMax) c.yMax = y;
++        if (!c.haveLast || ptr != c.lastPtr)
++        {
++            if (c.nAdv < PtrWalkCell::PW_CAP)
++            {
++                c.ptrVals[c.nAdv] = ptr;
++                c.advFrame[c.nAdv] = frameNo;
++                c.nAdv++;
++            }
++            c.lastPtr = ptr;
++            c.haveLast = true;
++        }
++    }
++
++    // ACCUMULATED tracking (item #7): note that `pc` (op `op`) wrote state cell
++    // `cellAddr` during the current play-call. If >=2 DISTINCT PCs write the same
++    // cell within one frame, the cell is an accumulator (multiple addends per
++    // call, e.g. freq = base + vib_acc + porta_acc). We keep a per-frame distinct-
++    // PC set per cell; on crossing >=2 we set multiWritten and union the
++    // contributing (pc, op) into the writer list the host reports.
++    inline void recordAccumWrite(uint16_t cellAddr, uint16_t pc, uint8_t op)
++    {
++        AccumTrack &a = accumTrack[cellAddr];
++        if (a.lastFrame != frameNo)
++        {
++            a.lastFrame = frameNo;
++            a.nFramePcs = 0;
++        }
++        bool seen = false;
++        for (uint8_t i = 0; i < a.nFramePcs; ++i)
++            if (a.framePcs[i] == pc) { seen = true; break; }
++        if (!seen && a.nFramePcs < 4)
++        {
++            a.framePcs[a.nFramePcs] = pc;
++            a.frameOps[a.nFramePcs] = op;
++            a.nFramePcs++;
++        }
++        if (a.nFramePcs >= 2)
++        {
++            a.multiWritten = true;
++            // union the frame's writers into the reported contributor list
++            for (uint8_t i = 0; i < a.nFramePcs; ++i)
++            {
++                bool have = false;
++                for (uint8_t j = 0; j < a.nWriters; ++j)
++                    if (a.writerPcs[j] == a.framePcs[i]) { have = true; break; }
++                if (!have && a.nWriters < 8)
++                {
++                    a.writerPcs[a.nWriters] = a.framePcs[i];
++                    a.writerOps[a.nWriters] = a.frameOps[i];
++                    a.nWriters++;
++                }
++            }
++        }
++    }
++
++    // RELO (item #3): record one iteration of an init block-copy store. `dst` is
++    // the store's effective address and `dstIdx` its index; the feeding indexed
++    // read supplies `src`/`srcIdx`. We fold per store-PC the src/dst bases
++    // (addr - idx), strides (smallest positive inter-iteration delta), and index
++    // span (-> length). delta = dst_base - src_base. Init phase only.
++    inline void recordReloCopy(uint16_t storePc, uint16_t dst, uint8_t dstIdx,
++                               bool haveSrc, uint16_t src, uint8_t srcIdx,
++                               uint16_t srcPc)
++    {
++        ReloCopy &r = reloCopies[storePc];
++        r.count++;
++        if (haveSrc)
++        {
++            const uint16_t sb = (uint16_t)(src - srcIdx);
++            if (!r.srcSet) { r.srcBase = sb; r.srcSet = true; r.srcReadPc = srcPc; }
++            if (r.count > 1)
++            {
++                const int32_t d = (int32_t)src - (int32_t)r.srcLastAddr;
++                if (d != 0 && (r.srcStride == 0 || (d > 0 && d < r.srcStride)))
++                    r.srcStride = d;
++            }
++            r.srcLastAddr = src;
++        }
++        const uint16_t db = (uint16_t)(dst - dstIdx);
++        if (!r.dstSet) { r.dstBase = db; r.dstSet = true; }
++        if (r.count > 1)
++        {
++            const int32_t d = (int32_t)dst - (int32_t)r.dstLastAddr;
++            if (d != 0 && (r.dstStride == 0 || (d > 0 && d < r.dstStride)))
++                r.dstStride = d;
++        }
++        r.dstLastAddr = dst;
++        if (dstIdx < r.idxMin) r.idxMin = dstIdx;
++        if (dstIdx > r.idxMax) r.idxMax = dstIdx;
 +    }
 +
 +    // ----- 6502 opcode semantics for the slicer (def/use/ALU classification) ---
@@ -1430,6 +1802,15 @@ index 00000000..11ca6128
 +                    if (fs.hasSrcAddr)
 +                        addLeaf(s, LK_RAM_READ, fs.srcAddr,
 +                                ramFn ? ramFn(ramCtx, fs.srcAddr) : 0);
++                    // feedsRegMask (item #5): the filler's indexed reads also feed
++                    // this SID register (the held-note table read attributes here).
++                    if (reg <= 24)
++                        for (uint8_t i = 0; i < fs.nPcs; ++i)
++                        {
++                            auto it = idxReads.find(fs.pcs[i]);
++                            if (it != idxReads.end())
++                                it->second.feedsRegMask |= (1u << reg);
++                        }
 +                    for (uint8_t i = 0; i < fs.nPcs; ++i) addPc(s, fs.pcs[i]);
 +                    if (s.opSeq.empty())
 +                        for (uint8_t i = 0; i < fs.nOps && s.opSeq.size() < 32; ++i)
@@ -1466,6 +1847,16 @@ index 00000000..11ca6128
 +                        if (iv < s.strideIdxMin) s.strideIdxMin = iv;
 +                        if (iv > s.strideIdxMax) s.strideIdxMax = iv;
 +                        push(SliceTask{ idx, in.idxUsed, 0, true });
++                    }
++                    // feedsRegMask (item #5): this indexed read's PC is an IDXR
++                    // table walk whose value flows to SID register `reg`; tag the
++                    // IDXR entry so the host knows which $D4xx lane this table
++                    // feeds (the reg attribution the slice already carries).
++                    if (in.idxUsed != SR_NONE && reg <= 24)
++                    {
++                        auto it = idxReads.find(in.pc);
++                        if (it != idxReads.end())
++                            it->second.feedsRegMask |= (1u << reg);
 +                    }
 +                    push(SliceTask{ idx, 0, in.memAddr, false });
 +                }
@@ -1520,6 +1911,83 @@ index 00000000..11ca6128
 +                if (l.kind == LK_STATE_CELL && l.addr == addr)
 +                    return true;
 +        return false;
++    }
++
++    // Finalize the recovery-offload captures (items #1, #5, #7). Call AFTER
++    // finalizeLeaves(). `loadLo`/`loadHi` bound the loaded image span (for the
++    // pointer-table target-in-image signal).
++    //  - IDXR scale fit: from the two distinct-index samples, scale = (a1-a0)/
++    //    (i1-i0) when it divides exactly, base = a0 - scale*i0.
++    //  - IDXR targetsInImage/targetsReadAsData: read the 16-bit values formed at
++    //    base+idx across the swept index range from the snapshot; if those target
++    //    addresses land in the image (and were read as data during play), this is
++    //    a pointer table.
++    //  - SIDDF accumulated: a write whose slice has a leaf state cell that was
++    //    written by >=2 distinct PCs in one frame is tagged accumulated, with the
++    //    contributing (op, cell) addends.
++    void finalizeOffload(uint16_t loadLo, uint16_t loadHi)
++    {
++        for (auto &kv : idxReads)
++        {
++            IdxSummary &s = kv.second;
++            // affine scale/base fit from two distinct-index samples
++            if (s.nSamp == 2 && s.sampIdx[1] != s.sampIdx[0])
++            {
++                const int32_t da = (int32_t)s.sampAddr[1] - (int32_t)s.sampAddr[0];
++                const int32_t di = (int32_t)s.sampIdx[1] - (int32_t)s.sampIdx[0];
++                if (di != 0 && (da % di) == 0)
++                {
++                    s.scale = da / di;
++                    s.baseFit = (uint16_t)((int32_t)s.sampAddr[0] -
++                                           s.scale * (int32_t)s.sampIdx[0]);
++                    s.scaleSet = true;
++                }
++            }
++            if (!s.scaleSet) { s.scale = 1; s.baseFit = s.base; }
++            // pointer-table target signals: form the 16-bit little-endian targets
++            // at (baseFit + scale*idx) over the swept index range, from the
++            // snapshot, and test whether they resolve in-image / read-as-data.
++            if (ramSnapshotTaken && loadHi > loadLo)
++            {
++                bool anyIn = false, anyRead = false, anyTarget = false;
++                const int lo = s.idxMin, hi = s.idxMax;
++                for (int i = lo; i <= hi && i <= 255; ++i)
++                {
++                    const int32_t ea = (int32_t)s.baseFit + s.scale * i;
++                    if (ea < 0 || ea + 1 > 0xffff) continue;
++                    const uint16_t tgt = (uint16_t)(ramSnapshot[ea] |
++                                                    (ramSnapshot[ea + 1] << 8));
++                    anyTarget = true;
++                    if (tgt >= loadLo && tgt < loadHi)
++                    {
++                        anyIn = true;
++                        if (acc[tgt] & ACC_READ_PLAY) anyRead = true;
++                    }
++                }
++                if (anyTarget) { s.targetsInImage = anyIn; s.targetsReadAsData = anyRead; }
++            }
++        }
++        // SIDDF accumulated propagation (item #7).
++        for (auto &kv : siddf)
++        {
++            SiddfSummary &s = kv.second;
++            for (const auto &l : s.leaves)
++            {
++                if (l.kind != LK_STATE_CELL) continue;
++                auto it = accumTrack.find(l.addr);
++                if (it == accumTrack.end() || !it->second.multiWritten) continue;
++                s.accumulated = true;
++                const AccumTrack &a = it->second;
++                for (uint8_t i = 0; i < a.nWriters; ++i)
++                {
++                    bool have = false;
++                    for (const auto &ad : s.addends)
++                        if (ad.cell == l.addr && ad.op == a.writerOps[i]) { have = true; break; }
++                    if (!have && s.addends.size() < 32)
++                        s.addends.push_back(SiddfSummary::Addend{ a.writerOps[i], l.addr });
++                }
++            }
++        }
 +    }
 +
 +};
