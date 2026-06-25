@@ -291,22 +291,15 @@ def test_stateseq_present_for_flagged_state_cells(trace):
     assert diffs == {1}, f"counter STATESEQ is not a +1 accumulator: diffs={diffs}"
 
 
-def test_stateseq_bounded_and_flat_vs_capture_length(tmp_path, fixture_sid):
-    """STATESEQ stays bounded (capped at M samples/cell) and does NOT grow once
-    the capture window exceeds M and all state cells are discovered: the section is
-    O(state cells * M), not O(frames). Trace two windows both >> M and require an
-    identical STATESEQ byte count."""
-
-    def stsq_nbytes(distill_path):
-        buf = distill_path.read_bytes()
-        i = buf.find(b"STSQ")
-        assert i >= 0, "no STSQ section"
-        # STSQ is followed by SDCU then END; measure to whichever comes first so the
-        # STSQ size is isolated from the (separately-bounded) SDCU section.
-        j = buf.find(b"SDCU", i)
-        if j < 0:
-            j = buf.find(b"END\x00", i)
-        return (j if j >= 0 else len(buf)) - i
+def test_stateseq_full_length_one_sample_per_frame(tmp_path, fixture_sid):
+    """STATESEQ now carries the FULL-LENGTH inter-frame state sequence (one sample
+    per play-call), so the freq/accumulator recovery covers the WHOLE tune -- the
+    old 512-sample window faked a wall on long tunes. The decisive properties are:
+    (1) the per-cell sample count GROWS with the capture window (it is O(frames),
+    not the old O(M)); (2) exactly one sample is taken per play-call -- a cell that
+    appears in several SIDDF leaves is NOT replicated per leaf -- so n_samples
+    tracks the number of frames the cell was live for, never exceeding the capture
+    length; (3) it stays within the u16 nSamples emit-field ceiling."""
 
     def trace_n(prefix, n):
         subprocess.run(
@@ -315,19 +308,34 @@ def test_stateseq_bounded_and_flat_vs_capture_length(tmp_path, fixture_sid):
         )
         return Path(f"{prefix}.distill.bin")
 
-    # both windows exceed M=512 so the per-cell sample count is saturated and the
-    # fixture's single state cell is discovered immediately -> identical size.
-    a = trace_n(tmp_path / "w800", 800)
-    b = trace_n(tmp_path / "w1600", 1600)
+    a = trace_n(tmp_path / "w200", 200)
+    b = trace_n(tmp_path / "w800", 800)
     sw_a = load_sidwr(Path(str(a).replace(".distill.bin", ".sidwr.bin")))
     sw_b = load_sidwr(Path(str(b).replace(".distill.bin", ".sidwr.bin")))
     assert sw_b.size > sw_a.size, "longer capture should have more SID writes"
-    assert stsq_nbytes(a) == stsq_nbytes(
-        b
-    ), "STATESEQ size grew with capture length -- it must be O(state cells * M)"
-    # and the per-cell sample count is capped at M=512.
-    d = parse_sdst(b)
-    assert all(e["n_samples"] <= 512 for e in d["stateseq"])
+
+    da = parse_sdst(a)
+    db = parse_sdst(b)
+    assert da["stateseq"] and db["stateseq"], "no STATESEQ sample sequences emitted"
+    # full-length: at the longer window the per-cell sample count must grow past the
+    # old 512 cap -- it now covers the whole capture, not a fixed window.
+    assert max(e["n_samples"] for e in db["stateseq"]) > 512, (
+        "STATESEQ did not grow past the old 512 cap -- the window-cap was not lifted"
+    )
+    # one sample per play-call: n_samples never exceeds the captured frame count and
+    # grows with the window (O(frames)).
+    by_addr_a = {e["addr"]: e["n_samples"] for e in da["stateseq"]}
+    by_addr_b = {e["addr"]: e["n_samples"] for e in db["stateseq"]}
+    for addr in set(by_addr_a) & set(by_addr_b):
+        assert by_addr_b[addr] >= by_addr_a[addr], (
+            f"cell ${addr:04x} sample count shrank with a longer window"
+        )
+    # within the u16 emit-field ceiling, and consistent with one-sample-per-frame
+    # (never more samples than play-calls in the 800-frame window).
+    assert all(e["n_samples"] <= 800 for e in db["stateseq"]), (
+        "a cell was sampled more than once per play-call (leaf over-sampling)"
+    )
+    assert all(e["n_samples"] <= 0xFFFF for e in db["stateseq"])
 
 
 def test_sdcu_present_for_state_cell_update(trace):
@@ -519,10 +527,13 @@ def test_smc_operand_emits_sdcu_and_stateseq(smc_trace):
     )
 
 
-def test_smc_operand_artifact_bounded_and_flat(tmp_path, smc_sid):
-    """The Gap-2 fix stays bounded/flat vs capture length: the SMC-operand cells'
-    SDCU structural part is invariant and STATESEQ saturates at the cap, so the
-    artifact does not grow proportionally with frames (design 3 boundedness)."""
+def test_smc_operand_sdcu_dag_invariant_stateseq_full_length(tmp_path, smc_sid):
+    """The SMC-operand cells' SDCU STRUCTURAL part (the update DAG: op_seq + leaves)
+    is INVARIANT vs capture length -- it is keyed by code site, O(code sites), not
+    O(frames), so it must be byte-identical across a short and a long window. The
+    STATESEQ inter-frame SAMPLE sequence, by contrast, is now FULL-LENGTH (one
+    sample per play-call): it must GROW with the window, not saturate at the old
+    512 cap -- that is the window-cap lift this change is for."""
     def cells(prefix, n):
         subprocess.run(
             [_sidtrace_bin(), str(smc_sid), "1", str(n), str(prefix)], check=True
@@ -543,8 +554,21 @@ def test_smc_operand_artifact_bounded_and_flat(tmp_path, smc_sid):
         assert a_sdcu[addr] == b_sdcu[addr], (
             f"SMC operand ${addr:04x} update DAG changed with capture length"
         )
-    for addr in set(a_st) & set(b_st):
-        assert a_st[addr] <= 512 and b_st[addr] <= 512, "STATESEQ exceeds the cap"
+    # STATESEQ is full-length now: a cell live across the whole capture has more
+    # samples in the longer window (O(frames)), never fewer, and never more than the
+    # captured frame count (one sample per play-call), within the u16 ceiling.
+    common_st = set(a_st) & set(b_st)
+    assert common_st, "no common STATESEQ cells across capture lengths"
+    for addr in common_st:
+        assert b_st[addr] >= a_st[addr], (
+            f"STATESEQ ${addr:04x} shrank with a longer window"
+        )
+        assert a_st[addr] <= 600 and b_st[addr] <= 1200, (
+            "STATESEQ exceeded the captured frame count (leaf over-sampling)"
+        )
+        assert b_st[addr] <= 0xFFFF
+    # at least one cell actually grew past the old 512 cap (proves the lift).
+    assert max(b_st.values()) > 512, "STATESEQ did not grow past the old 512 cap"
 
 
 def test_recovery_offload_sections_present_and_parse(trace):
@@ -585,3 +609,55 @@ def test_idxs_affine_fit_is_consistent(trace):
             assert (s["base_fit"] + s["scale"] * i1) & 0xFFFF == a1
         else:
             assert s["scale"] == 1, "unset fit must default to legacy scale 1"
+
+
+@pytest.fixture(scope="session")
+def ptr_walk_sid(tmp_path_factory):
+    """A PSID whose play routine walks a zero-page pointer pair with ``LDA (zp),Y``,
+    advancing the pointer every play-call -- the orderlist->pattern pointer the PWLK
+    capture resolves. The advance count grows 1:1 with the captured frame count."""
+    d = tmp_path_factory.mktemp("ptr_walk_sid")
+    sid = d / "ptr.sid"
+    subprocess.run(
+        [sys.executable, str(HERE / "make_ptr_walk_sid.py"), str(sid)],
+        check=True,
+    )
+    assert sid.stat().st_size > 0
+    return sid
+
+
+def test_pwlk_full_length_advance_schedule(tmp_path, ptr_walk_sid):
+    """PWLK now carries the FULL-LENGTH orderlist->pattern advance schedule, not the
+    first 256 advances (real tunes reach Music_Assembler 10759 / GoatTracker 2726
+    advances; the old 256 cap truncated the song). The decisive properties:
+    (1) the per-pair advance count GROWS with the capture window (it is O(advances),
+    not the old O(256)); (2) it exceeds the old 256 cap at a long-enough window;
+    (3) ptr_vals and adv_frames stay length-consistent with nAdv; (4) it stays
+    within the u16 nAdv emit-field ceiling."""
+
+    def walk(prefix, n):
+        subprocess.run(
+            [_sidtrace_bin(), str(ptr_walk_sid), "1", str(n), str(prefix)],
+            check=True,
+        )
+        d = parse_sdst(Path(f"{prefix}.distill.bin"))
+        assert d["ptr_walks"], "no PWLK pointer-walk captured"
+        w = d["ptr_walks"][0]
+        # the on-disk arrays must agree with the advertised advance count.
+        assert len(w["ptr_vals"]) == len(w["adv_frames"])
+        return w
+
+    a = walk(tmp_path / "w300", 300)
+    b = walk(tmp_path / "w600", 600)
+    na, nb = len(a["ptr_vals"]), len(b["ptr_vals"])
+    # the advance schedule grows with the window (the cap was lifted) ...
+    assert nb > na, "PWLK advance count did not grow with the capture window"
+    # ... and exceeds the old 256-advance cap (the schedule is no longer truncated).
+    assert na > 256, f"PWLK still capped near 256 ({na} advances at 300 frames)"
+    assert nb > 256
+    # within the u16 emit-field ceiling.
+    assert nb <= 0xFFFF
+    # advance frames are monotone non-decreasing play-call indices.
+    assert all(
+        b["adv_frames"][i] <= b["adv_frames"][i + 1] for i in range(nb - 1)
+    ), "PWLK advance frames are not monotone"
