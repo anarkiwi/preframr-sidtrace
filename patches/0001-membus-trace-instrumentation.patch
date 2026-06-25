@@ -166,10 +166,10 @@ index 691ab7f8..e82f4a3b 100644
          if (addr >= 0x0400 && addr <= 0x07ff)
 diff --git a/src/c64/membus_trace.h b/src/c64/membus_trace.h
 new file mode 100644
-index 00000000..44d7c7b6
+index 00000000..303fcd39
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,1825 @@
+@@ -0,0 +1,1857 @@
 +/*
 + * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
 + * Not part of upstream libsidplayfp. Scratch use only.
@@ -333,13 +333,23 @@ index 00000000..44d7c7b6
 +// resolved orderlist->pattern stream (each new pointer = a pattern start the
 +// orderlist advanced to); the Y index range per pointer is the row span walked;
 +// the frame index of each advance is a note/row onset. Keyed by the zp-pair base
-+// address. Dedup consecutive-equal pointer values into ADVANCE events; bounded
-+// to PWLK_CAP advances per pair, flat vs run length.
++// address. Dedup consecutive-equal pointer values into ADVANCE events.
++//
++// FULL-LENGTH (recovery campaign): the advance sequence is the resolved
++// orderlist->pattern SCHEDULE; truncating it (the old 256-advance cap) loses the
++// tail of the song (real advance counts: Music_Assembler 10759, GoatTracker
++// 2726). The recovery needs the whole schedule, so we keep the advances in a
++// growable vector -- not flat vs run length, but the schedule IS the program the
++// recovery recovers (a few KB of u16/u32 per zp-pair, one per orderlist pointer,
++// dwarfed by the resolved-pattern saving it unblocks). The on-disk nAdv field is
++// u16, so a pathological pair with >65535 advances would saturate; PW_CAP caps
++// the in-memory growth at that ceiling to keep the emit lossless-or-saturated
++// rather than silently truncated to 256.
 +struct PtrWalkCell
 +{
-+    static constexpr uint32_t PW_CAP = 256;   // bounded advance events per pair
-+    uint16_t ptrVals[PW_CAP];                 // distinct consecutive pointer values
-+    uint32_t advFrame[PW_CAP];                // frame (play-call) index of each advance
++    static constexpr uint32_t PW_CAP = 65535;  // u16 nAdv ceiling (emit field width)
++    std::vector<uint16_t> ptrVals;            // distinct consecutive pointer values
++    std::vector<uint32_t> advFrame;           // frame (play-call) index of each advance
 +    uint32_t nAdv = 0;                        // number of advance events recorded
 +    uint64_t count = 0;                       // total (zp),Y accesses on this pair
 +    uint8_t  yMin = 0xff, yMax = 0;           // Y index range across all accesses
@@ -426,8 +436,14 @@ index 00000000..44d7c7b6
 +// M), flat vs run length. (design 3.2)
 +struct StateSeqCell
 +{
-+    static constexpr uint32_t SS_M = 512;   // bounded sample count per cell
-+    uint16_t samples[SS_M];                 // first SS_M per-play-call samples (u16-wide so a 16-bit pair can be stored if ever needed; cells are u8 in practice)
++    // FULL-LENGTH (recovery campaign): the inter-frame state sequence must cover
++    // the WHOLE tune (~2270-2300 frames) for the freq/accumulator recovery to be
++    // complete -- the old 512-sample window faked a wall on long tunes. We grow the
++    // sample vector to the tune length, capped only at the u16 nSamples emit-field
++    // ceiling. (The host's holds-to-end check is unaffected; it now sees the full
++    // sequence.)
++    static constexpr uint32_t SS_M = 65535;  // u16 nSamples ceiling (emit field width)
++    std::vector<uint16_t> samples;          // per-play-call samples (u16-wide so a 16-bit pair can be stored if ever needed; cells are u8 in practice)
 +    uint32_t nSamples = 0;                  // number of samples actually taken
 +    uint32_t totalFrames = 0;              // play-calls seen for this cell
 +    uint32_t firstSeenFrame = 0;            // global play-call index of sample[0]
@@ -444,6 +460,8 @@ index 00000000..44d7c7b6
 +    bool     constDiff = true;              // first-difference constant so far (mod 256)
 +    uint16_t lastSample = 0;
 +    bool     haveLast = false;
++    uint32_t lastSampledFrame = 0xffffffff;  // frame of the most recent sample
++                                             // (one sample per frame per cell)
 +};
 +
 +// One retired-instruction record in the ring buffer. Assembled from the bus
@@ -1066,7 +1084,10 @@ index 00000000..44d7c7b6
 +    // address (the operand byte); the live pointer value is ram(zp)|ram(zp+1)<<8;
 +    // `y` is the index. We dedup consecutive-equal pointer values into ADVANCE
 +    // events (a new pointer = the orderlist advanced to a new pattern) and record
-+    // the frame index of each advance (the row/note onset). Bounded per pair.
++    // the frame index of each advance (the row/note onset). FULL-LENGTH: the whole
++    // advance schedule is kept (growable), capped only at the u16 emit-field
++    // ceiling, so the recovery sees the entire orderlist->pattern schedule (not the
++    // first 256 advances).
 +    inline void recordPtrWalk(uint16_t zp, uint8_t y, bool isStore)
 +    {
 +        if (!ramFn) return;
@@ -1081,8 +1102,8 @@ index 00000000..44d7c7b6
 +        {
 +            if (c.nAdv < PtrWalkCell::PW_CAP)
 +            {
-+                c.ptrVals[c.nAdv] = ptr;
-+                c.advFrame[c.nAdv] = frameNo;
++                c.ptrVals.push_back(ptr);
++                c.advFrame.push_back(frameNo);
 +                c.nAdv++;
 +            }
 +            c.lastPtr = ptr;
@@ -1411,8 +1432,16 @@ index 00000000..44d7c7b6
 +                it = stateSeq.emplace(a, StateSeqCell{}).first;
 +            }
 +            StateSeqCell &c = it->second;
++            // ONE sample per play-call (frame): a cell that appears in several
++            // SIDDF leaves would otherwise be sampled once per leaf each frame,
++            // replicating the value N x and de-aligning the sequence from the frame
++            // grid the host renders against (this was masked by the old 512 cap;
++            // full-length capture exposes it). Guard on the frame index so each
++            // cell contributes exactly one sample per frame.
++            if (c.lastSampledFrame == frameNo) return;
 +            if (c.totalFrames == 0) c.firstSeenFrame = frameNo;
 +            const uint8_t v = ramFn(ramCtx, a);
++            c.lastSampledFrame = frameNo;
 +            c.totalFrames++;
 +            // running constant-first-difference (mod 256) holds-to-end check
 +            if (c.haveLast)
@@ -1424,7 +1453,10 @@ index 00000000..44d7c7b6
 +            c.lastSample = v;
 +            c.haveLast = true;
 +            if (c.nSamples < StateSeqCell::SS_M)
-+                c.samples[c.nSamples++] = v;
++            {
++                c.samples.push_back(v);
++                c.nSamples++;
++            }
 +        };
 +        // Sample the memory-leaf addresses the live SIDDF slices have surfaced
 +        // that ALSO satisfy the state-cell access predicate (the same predicate
