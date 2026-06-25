@@ -653,6 +653,68 @@ static long emit_distill(const char *path, MemBusTrace &tr,
         fseek(f, end, SEEK_SET);
     }
 
+    // IWLK: per-(pc,voice) instrument-table freq-modulation walk-index. For each
+    // freq-feeding IDXR PC (feedsRegMask intersects a freq lo/hi reg) we emit the
+    // FULL-LENGTH per-frame u8 index the playroutine walked into the RAM
+    // instrument freq-table. The capture is a sparse (frame, index) stream (one
+    // per frame the PC issued a qualifying read); we DENSIFY it to nFrames by
+    // forward-filling a held frame with the prior index (a held note keeps the
+    // table position the player last advanced to). The PR-A reader parses this and
+    // the PR-C freq-mod fitter recovers freq = note_base + table[index] with a
+    // per-note-onset reset -- rather than storing the per-frame freq lane
+    // (HARD RULE #0). A PC whose freq is computed WITHOUT a table walk (no
+    // qualifying direct-indexed read) carries no IWLK entry; the host records
+    // which tunes do/don't carry one. Layout: tag "IWLK"; nentries u32; then per
+    // entry: pc u16, voice u8 (freq-lo reg 0/7/14), _pad u8, nFrames u32, then
+    // nFrames * (index u8).
+    {
+        const uint32_t freqMask =
+            (1u << 0) | (1u << 1) | (1u << 7) | (1u << 8) | (1u << 14) | (1u << 15);
+        // The dense frame count: the play-call boundaries the detector crossed.
+        const uint32_t fc = tr.frameNo ? tr.frameNo : (uint32_t)nframes;
+        fwrite("IWLK", 1, 4, f);
+        long nentPos = ftell(f);
+        wr_u32(f, 0);                          // nentries, backpatched
+        uint32_t nent = 0;
+        for (const auto &kv : tr.idxReads)
+        {
+            const libsidplayfp::IdxSummary &s = kv.second;
+            const uint32_t fed = s.feedsRegMask & freqMask;
+            if (!fed) continue;                // not a freq-feeding table walk
+            if (s.idxFrameSamples.empty()) continue;  // no resolvable walk index
+            // Voice = the freq-lo register the table feeds. Prefer the lo reg of
+            // the lowest fed voice (0/7/14); a hi-only fed mask maps to its lo.
+            uint8_t voice;
+            if (fed & ((1u << 0) | (1u << 1)))       voice = 0;
+            else if (fed & ((1u << 7) | (1u << 8)))  voice = 7;
+            else                                      voice = 14;
+            wr_u16(f, kv.first);               // pc
+            wr_u8(f, voice);
+            wr_u8(f, 0);                        // _pad
+            wr_u32(f, fc);
+            // Densify: forward-fill a per-frame index array of length fc. Frames
+            // before the first sample carry the first index (the table position at
+            // note onset); a held frame carries the prior frame's index.
+            uint8_t held = s.idxFrameSamples.front().second;
+            size_t si = 0;
+            for (uint32_t fr = 0; fr < fc; ++fr)
+            {
+                while (si < s.idxFrameSamples.size() &&
+                       s.idxFrameSamples[si].first == fr)
+                {
+                    held = s.idxFrameSamples[si].second;
+                    ++si;
+                }
+                wr_u8(f, held);
+            }
+            nent++;
+        }
+        long end = ftell(f);
+        fseek(f, nentPos, SEEK_SET);
+        wr_u32(f, nent);
+        fseek(f, end, SEEK_SET);
+    }
+
     fwrite("END\0", 1, 4, f);
     long sz = ftell(f);
     fclose(f);
