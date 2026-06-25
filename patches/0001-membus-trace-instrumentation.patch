@@ -1,3 +1,91 @@
+diff --git a/src/builders/sidlite-builder/sidlite-emu.cpp b/src/builders/sidlite-builder/sidlite-emu.cpp
+index ac7916da..37aa2411 100644
+--- a/src/builders/sidlite-builder/sidlite-emu.cpp
++++ b/src/builders/sidlite-builder/sidlite-emu.cpp
+@@ -81,7 +81,16 @@ void SIDLiteEmu::clock()
+ {
+     const event_clock_t cycles = eventScheduler->getTime(EVENT_CLOCK_PHI1) - m_accessClk;
+     m_accessClk += cycles;
+-    m_bufferpos += m_sid.clock(cycles, m_buffer+m_bufferpos);
++    // Cap rendering to the space left in m_buffer. The host (Player::play) drains
++    // the buffer once per play() chunk; a tune that performs very many SID-register
++    // accesses within one chunk (each calling clock()) can otherwise accumulate
++    // more than the 20ms buffer holds and overrun it. m_accessClk is advanced by
++    // the full cycle count above regardless, so the SID register access cadence
++    // (and thus the bus trace) is unaffected; only the discarded audio is clipped.
++    const int space = m_buffersize - m_bufferpos;
++    if (space <= 0)
++        return;
++    m_bufferpos += m_sid.clock(cycles, m_buffer+m_bufferpos, space);
+ }
+ 
+ int SIDLiteEmu::getLevel() const
+@@ -125,6 +134,7 @@ void SIDLiteEmu::sampling(float systemclock, float freq,
+     // 20ms buffer
+     const int buffersize = std::ceil((freq / 1000.f) * 20.f);
+     m_buffer = new short[buffersize];
++    m_buffersize = buffersize;   // remembered so clock() can bound writes
+     m_status = true;
+ }
+ 
+diff --git a/src/builders/sidlite-builder/sidlite-emu.h b/src/builders/sidlite-builder/sidlite-emu.h
+index c1056d45..1f89e0f0 100644
+--- a/src/builders/sidlite-builder/sidlite-emu.h
++++ b/src/builders/sidlite-builder/sidlite-emu.h
+@@ -43,6 +43,12 @@ class SIDLiteEmu final : public sidemu
+ private:
+     SIDLite::SID &m_sid;
+ 
++    // Capacity (in samples) of the inherited m_buffer, remembered from the last
++    // sampling() call so clock() can cap rendering to the remaining space and
++    // never write past the allocation (the m_buffer overrun that surfaced as a
++    // teardown "double free or corruption" on a densely-polling RSID).
++    int m_buffersize = 0;
++
+ public:
+     static const char* getCredits();
+ 
+diff --git a/src/builders/sidlite-builder/sidlite/SID.cpp b/src/builders/sidlite-builder/sidlite/SID.cpp
+index fed8b2fc..5366af31 100644
+--- a/src/builders/sidlite-builder/sidlite/SID.cpp
++++ b/src/builders/sidlite-builder/sidlite/SID.cpp
+@@ -34,10 +34,15 @@
+ namespace SIDLite
+ {
+ 
+-int SID::clock(unsigned int cycles, short* buf)
++int SID::clock(unsigned int cycles, short* buf, int maxSamples)
+ {
+     int i = 0;
+-    while (cycles > 0)
++    // Stop once the caller's buffer is full: writing buf[i] for i >= maxSamples
++    // would run past the allocation and corrupt the heap. The remaining cycles
++    // are simply not rendered this call -- harmless, because the only consumer is
++    // the discarded audio mixdown; the SID register bus trace (the recovery
++    // artifact) is independent of these samples.
++    while (cycles > 0 && i < maxSamples)
+     {
+         short output;
+         if (generateSample(cycles, output))
+diff --git a/src/builders/sidlite-builder/sidlite/SID.h b/src/builders/sidlite-builder/sidlite/SID.h
+index 05254e00..ef111d71 100644
+--- a/src/builders/sidlite-builder/sidlite/SID.h
++++ b/src/builders/sidlite-builder/sidlite/SID.h
+@@ -49,6 +49,14 @@ public:
+     int read(int addr) const;
+     int clock(unsigned int cycles, short* buf);
+ 
++    // Render up to `cycles` worth of samples into `buf`, but never write more
++    // than `maxSamples` elements (the remaining capacity of the caller's buffer).
++    // Returns the number of samples written. The cap prevents a heap overflow
++    // when the caller accumulates many SID accesses between buffer drains (a
++    // self-installed-IRQ RSID whose generator polls/writes SID registers densely
++    // within one Player::play() chunk would otherwise overrun the 20ms buffer).
++    int clock(unsigned int cycles, short* buf, int maxSamples);
++
+     void setChipModel(model_t model);
+     void setRealSIDmode(bool mode);
+     bool setSamplingParameters(unsigned int clockFrequency, unsigned short samplingFrequency);
 diff --git a/src/c64/CPU/mos6510.cpp b/src/c64/CPU/mos6510.cpp
 index 10bec1a1..12cbe0aa 100644
 --- a/src/c64/CPU/mos6510.cpp
@@ -166,10 +254,10 @@ index 691ab7f8..e82f4a3b 100644
          if (addr >= 0x0400 && addr <= 0x07ff)
 diff --git a/src/c64/membus_trace.h b/src/c64/membus_trace.h
 new file mode 100644
-index 00000000..303fcd39
+index 00000000..8139e8fc
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,1857 @@
+@@ -0,0 +1,1883 @@
 +/*
 + * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
 + * Not part of upstream libsidplayfp. Scratch use only.
@@ -241,6 +329,7 @@ index 00000000..303fcd39
 +#include <cstdio>
 +#include <cstring>
 +#include <map>
++#include <utility>
 +#include <vector>
 +
 +namespace libsidplayfp
@@ -324,6 +413,18 @@ index 00000000..303fcd39
 +    uint32_t feedsRegMask = 0;
 +    bool     targetsInImage = false;
 +    bool     targetsReadAsData = false;
++
++    // --- IWLK per-frame walk-index (the freq-modulation generator input) ----
++    // For a freq-feeding direct-indexed read, the SEQUENCE of (frame, index)
++    // samples -- the per-play-call index the playroutine walked into the RAM
++    // instrument freq-table. The host (PR-A reader / PR-C fitter) densifies this
++    // to a full-length per-frame array (forward-filling a held frame with the
++    // prior index) and recovers freq = note_base + instr_freq_table[index],
++    // retriggered at note onset -- rather than storing the per-frame freq lane
++    // (HARD RULE #0). ONE sample per frame (the last qualifying read that frame),
++    // guarded by lastIdxFrame; emitted only for freq-feeding PCs at finalize.
++    std::vector<std::pair<uint32_t, uint8_t>> idxFrameSamples;
++    uint32_t lastIdxFrame = 0xffffffff;  // de-dup guard: one sample per frame
 +};
 +
 +// --- PWLK ((zp),Y pointer-walk capture; recovery-offload item #2) ----------
@@ -1048,6 +1149,19 @@ index 00000000..303fcd39
 +        else if (s.nSamp == 1 && sidx != s.sampIdx[0])
 +        {
 +            s.sampIdx[1] = sidx; s.sampAddr[1] = addr; s.nSamp = 2;
++        }
++        // IWLK per-frame walk-index: record ONE (frame, index) sample per frame
++        // for this direct-indexed read -- the last qualifying read of the frame
++        // wins (the play-call's final table walk = the value driving the SID
++        // write this frame). Bounded: one u8 per frame per IDXR PC. The emit
++        // filter keeps only freq-feeding PCs, so this stays a handful of small
++        // vectors. lastIdxFrame de-dups within a frame.
++        if (s.lastIdxFrame == frameNo && !s.idxFrameSamples.empty())
++            s.idxFrameSamples.back().second = sidx;  // overwrite: last read wins
++        else if (s.idxFrameSamples.size() < StateSeqCell::SS_M)
++        {
++            s.idxFrameSamples.emplace_back(frameNo, sidx);
++            s.lastIdxFrame = frameNo;
 +        }
 +    }
 +
@@ -2027,91 +2141,3 @@ index 00000000..303fcd39
 +} // namespace libsidplayfp
 +
 +#endif // MEMBUS_TRACE_H
-diff --git a/src/builders/sidlite-builder/sidlite-emu.cpp b/src/builders/sidlite-builder/sidlite-emu.cpp
-index ac7916da..37aa2411 100644
---- a/src/builders/sidlite-builder/sidlite-emu.cpp
-+++ b/src/builders/sidlite-builder/sidlite-emu.cpp
-@@ -81,7 +81,16 @@ void SIDLiteEmu::clock()
- {
-     const event_clock_t cycles = eventScheduler->getTime(EVENT_CLOCK_PHI1) - m_accessClk;
-     m_accessClk += cycles;
--    m_bufferpos += m_sid.clock(cycles, m_buffer+m_bufferpos);
-+    // Cap rendering to the space left in m_buffer. The host (Player::play) drains
-+    // the buffer once per play() chunk; a tune that performs very many SID-register
-+    // accesses within one chunk (each calling clock()) can otherwise accumulate
-+    // more than the 20ms buffer holds and overrun it. m_accessClk is advanced by
-+    // the full cycle count above regardless, so the SID register access cadence
-+    // (and thus the bus trace) is unaffected; only the discarded audio is clipped.
-+    const int space = m_buffersize - m_bufferpos;
-+    if (space <= 0)
-+        return;
-+    m_bufferpos += m_sid.clock(cycles, m_buffer+m_bufferpos, space);
- }
- 
- int SIDLiteEmu::getLevel() const
-@@ -125,6 +134,7 @@ void SIDLiteEmu::sampling(float systemclock, float freq,
-     // 20ms buffer
-     const int buffersize = std::ceil((freq / 1000.f) * 20.f);
-     m_buffer = new short[buffersize];
-+    m_buffersize = buffersize;   // remembered so clock() can bound writes
-     m_status = true;
- }
- 
-diff --git a/src/builders/sidlite-builder/sidlite-emu.h b/src/builders/sidlite-builder/sidlite-emu.h
-index c1056d45..1f89e0f0 100644
---- a/src/builders/sidlite-builder/sidlite-emu.h
-+++ b/src/builders/sidlite-builder/sidlite-emu.h
-@@ -43,6 +43,12 @@ class SIDLiteEmu final : public sidemu
- private:
-     SIDLite::SID &m_sid;
- 
-+    // Capacity (in samples) of the inherited m_buffer, remembered from the last
-+    // sampling() call so clock() can cap rendering to the remaining space and
-+    // never write past the allocation (the m_buffer overrun that surfaced as a
-+    // teardown "double free or corruption" on a densely-polling RSID).
-+    int m_buffersize = 0;
-+
- public:
-     static const char* getCredits();
- 
-diff --git a/src/builders/sidlite-builder/sidlite/SID.cpp b/src/builders/sidlite-builder/sidlite/SID.cpp
-index fed8b2fc..5366af31 100644
---- a/src/builders/sidlite-builder/sidlite/SID.cpp
-+++ b/src/builders/sidlite-builder/sidlite/SID.cpp
-@@ -34,10 +34,15 @@
- namespace SIDLite
- {
- 
--int SID::clock(unsigned int cycles, short* buf)
-+int SID::clock(unsigned int cycles, short* buf, int maxSamples)
- {
-     int i = 0;
--    while (cycles > 0)
-+    // Stop once the caller's buffer is full: writing buf[i] for i >= maxSamples
-+    // would run past the allocation and corrupt the heap. The remaining cycles
-+    // are simply not rendered this call -- harmless, because the only consumer is
-+    // the discarded audio mixdown; the SID register bus trace (the recovery
-+    // artifact) is independent of these samples.
-+    while (cycles > 0 && i < maxSamples)
-     {
-         short output;
-         if (generateSample(cycles, output))
-diff --git a/src/builders/sidlite-builder/sidlite/SID.h b/src/builders/sidlite-builder/sidlite/SID.h
-index 05254e00..ef111d71 100644
---- a/src/builders/sidlite-builder/sidlite/SID.h
-+++ b/src/builders/sidlite-builder/sidlite/SID.h
-@@ -49,6 +49,14 @@ public:
-     int read(int addr) const;
-     int clock(unsigned int cycles, short* buf);
- 
-+    // Render up to `cycles` worth of samples into `buf`, but never write more
-+    // than `maxSamples` elements (the remaining capacity of the caller's buffer).
-+    // Returns the number of samples written. The cap prevents a heap overflow
-+    // when the caller accumulates many SID accesses between buffer drains (a
-+    // self-installed-IRQ RSID whose generator polls/writes SID registers densely
-+    // within one Player::play() chunk would otherwise overrun the 20ms buffer).
-+    int clock(unsigned int cycles, short* buf, int maxSamples);
-+
-     void setChipModel(model_t model);
-     void setRealSIDmode(bool mode);
-     bool setSamplingParameters(unsigned int clockFrequency, unsigned short samplingFrequency);

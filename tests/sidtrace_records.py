@@ -72,6 +72,10 @@ _SDAC_HEAD = struct.Struct("<HBBH")
 _SDAC_ADDEND = struct.Struct("<BH")
 _DIGI_REC = struct.Struct("<IIBBBBII")
 _TMPO_ENTRY = struct.Struct("<HBB")
+# IWLK (per-(pc,voice) instrument-table freq walk-index): pc u16, voice u8, pad,
+# nFrames u32, then nFrames * (index u8). The per-frame index into the RAM
+# instrument freq-table the freq-feeding IDXR PC walked (the freq-mod generator).
+_IWLK_HEAD = struct.Struct("<HBxI")
 
 # Leaf kinds (mirror membus_trace.h LeafKind).
 LK_IMMEDIATE = 0
@@ -160,6 +164,7 @@ def parse_sdst(path):
     sid_accum = []
     digi = None
     tempo_cands = []
+    iwlk_walks = []
     while off < len(buf):
         tag = buf[off : off + 4]
         off += 4
@@ -386,6 +391,15 @@ def parse_sdst(path):
                 cell, reload, _p = _TMPO_ENTRY.unpack_from(buf, off)
                 off += _TMPO_ENTRY.size
                 tempo_cands.append({"cell": cell, "reload": reload})
+        elif tag == b"IWLK":
+            (nent,) = struct.unpack_from("<I", buf, off)
+            off += 4
+            for _ in range(nent):
+                pc, voice, nfr = _IWLK_HEAD.unpack_from(buf, off)
+                off += _IWLK_HEAD.size
+                index = np.frombuffer(buf[off : off + nfr], dtype=np.uint8).copy()
+                off += nfr
+                iwlk_walks.append({"pc": pc, "voice": voice, "index": index})
         else:
             raise ValueError(f"unknown SDST section {tag!r}")
 
@@ -412,6 +426,7 @@ def parse_sdst(path):
         "sid_accum": sid_accum,
         "digi": digi,
         "tempo_cands": tempo_cands,
+        "iwlk_walks": iwlk_walks,
     }
 
 

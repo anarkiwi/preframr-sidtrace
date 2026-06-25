@@ -661,3 +661,79 @@ def test_pwlk_full_length_advance_schedule(tmp_path, ptr_walk_sid):
     assert all(
         b["adv_frames"][i] <= b["adv_frames"][i + 1] for i in range(nb - 1)
     ), "PWLK advance frames are not monotone"
+
+
+@pytest.fixture(scope="session")
+def freq_table_sid(tmp_path_factory):
+    """A PSID whose voice-0 frequency is read DIRECTLY from a RAM freq-table indexed
+    by a per-play-call walking cursor -- the instrument-table freq-modulation idiom
+    the IWLK capture targets. The loaded table byte feeds $D400/$D401 directly (a
+    DIRECT slice, unlike the SMC-operand cursor fixture), so the SID-write slicer
+    attributes the indexed read to the freq register and IWLK is emitted."""
+    d = tmp_path_factory.mktemp("freq_table_sid")
+    sid = d / "freqtbl.sid"
+    subprocess.run(
+        [sys.executable, str(HERE / "make_freq_table_sid.py"), str(sid)],
+        check=True,
+    )
+    assert sid.stat().st_size > 0
+    return sid
+
+
+def test_iwlk_key_always_present(trace):
+    """The IWLK section parses into an ``iwlk_walks`` list on every artifact. The base
+    fixture writes a CONSTANT frequency (no table walk), so freq is computed without a
+    resolvable index -> it correctly carries NO IWLK entry (the absence the PR records
+    per tune). The KEY is always present (additive section, possibly empty)."""
+    d = parse_sdst(trace["distill"])
+    assert "iwlk_walks" in d, "IWLK list missing from parse"
+    assert d["iwlk_walks"] == [], "constant-freq fixture must carry no IWLK walk"
+
+
+def test_iwlk_emitted_for_freq_table_walk(tmp_path, freq_table_sid):
+    """A direct freq-table walk emits IWLK: per freq-feeding (pc, voice), the
+    full-length per-frame u8 walk-index into the RAM freq-table. The index is the
+    +1-mod-P cursor the player advanced each play-call -- the freq-mod generator
+    input the PR-C fitter recovers ``freq = note_base + freqtbl[index]`` from."""
+    prefix = tmp_path / "ft"
+    subprocess.run(
+        [_sidtrace_bin(), str(freq_table_sid), "1", "600", str(prefix)],
+        check=True,
+    )
+    d = parse_sdst(Path(f"{prefix}.distill.bin"))
+    walks = d["iwlk_walks"]
+    assert walks, "no IWLK walk-index emitted for a direct freq-table walk"
+    fc = d["nframes"]
+    freq_voices = {0, 7, 14}
+    for w in walks:
+        assert w["voice"] in freq_voices, f"IWLK voice {w['voice']} not a freq-lo reg"
+        # full-length per-frame index (one u8 per captured frame, NOT a 2-sample fit)
+        assert w["index"].dtype == np.uint8
+        assert len(w["index"]) > 1, "IWLK index is not per-frame"
+        assert w["index"].max() < 8, "index out of the P=8 freq-table range"
+    # the walk-index is the per-play-call +1-mod-8 cursor: at least P distinct values
+    # and it cycles (a held constant would be uniq==1). The walk advances every frame.
+    by_pc = {w["pc"]: w for w in walks}
+    any_ramp = any(len(set(w["index"].tolist())) >= 4 for w in by_pc.values())
+    assert any_ramp, "IWLK index does not walk the table (expected a wrapping cursor)"
+    # the dense per-frame array spans (nearly) the whole capture, not a truncated fit.
+    assert max(len(w["index"]) for w in walks) >= fc - 64
+
+
+def test_iwlk_is_additive_sidwr_unaffected(tmp_path, freq_table_sid):
+    """IWLK is a distill-only additive section: emitting it does NOT change the
+    ``.sidwr.bin`` render stream (the byte-exact gate) -- the capture only appends a
+    new tagged section after TMPO, leaving every prior section and the SID-write
+    stream untouched. Here we assert the SID-write count the distill summary reports
+    equals the sidwr stream size even with IWLK present (the invariant the corpus
+    render gate depends on)."""
+    prefix = tmp_path / "ft2"
+    subprocess.run(
+        [_sidtrace_bin(), str(freq_table_sid), "1", "600", str(prefix)],
+        check=True,
+    )
+    d = parse_sdst(Path(f"{prefix}.distill.bin"))
+    sw = load_sidwr(Path(f"{prefix}.sidwr.bin"))
+    total = sum(c for _pc, _reg, c, _v in d["sid_writes"])
+    assert total == sw.size, "SID-write summary diverged from sidwr (IWLK not additive)"
+    assert d["iwlk_walks"], "expected IWLK on the freq-table fixture"
