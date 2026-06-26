@@ -254,10 +254,10 @@ index 691ab7f8..e82f4a3b 100644
          if (addr >= 0x0400 && addr <= 0x07ff)
 diff --git a/src/c64/membus_trace.h b/src/c64/membus_trace.h
 new file mode 100644
-index 00000000..8139e8fc
+index 00000000..3598f1f8
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,1883 @@
+@@ -0,0 +1,1892 @@
 +/*
 + * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
 + * Not part of upstream libsidplayfp. Scratch use only.
@@ -451,6 +451,8 @@ index 00000000..8139e8fc
 +    static constexpr uint32_t PW_CAP = 65535;  // u16 nAdv ceiling (emit field width)
 +    std::vector<uint16_t> ptrVals;            // distinct consecutive pointer values
 +    std::vector<uint32_t> advFrame;           // frame (play-call) index of each advance
++    std::vector<uint8_t>  advY;               // Y index (authored orderlist position) at each advance
++    std::vector<uint16_t> advPc;              // PC of the (zp),Y read at each advance (consuming voice proxy)
 +    uint32_t nAdv = 0;                        // number of advance events recorded
 +    uint64_t count = 0;                       // total (zp),Y accesses on this pair
 +    uint8_t  yMin = 0xff, yMax = 0;           // Y index range across all accesses
@@ -978,7 +980,7 @@ index 00000000..8139e8fc
 +            // sequence + Y span + advance frames (loads 0xB1 + stores 0x91).
 +            if (isIndIndexed(cur.opcode) && cur.zpPtrSet &&
 +                (cur.memRead || cur.memWrite))
-+                recordPtrWalk(cur.zpPtr, cur.idxVal, isStore(cur.opcode));
++                recordPtrWalk(cur.zpPtr, cur.idxVal, isStore(cur.opcode), cur.pc);
 +        }
 +        // RELO (item #3): an init-phase block-copy. The ring buffer is play-only,
 +        // so we pair a `LDA src,Y` (latched as the last init indexed read) with the
@@ -1202,7 +1204,7 @@ index 00000000..8139e8fc
 +    // advance schedule is kept (growable), capped only at the u16 emit-field
 +    // ceiling, so the recovery sees the entire orderlist->pattern schedule (not the
 +    // first 256 advances).
-+    inline void recordPtrWalk(uint16_t zp, uint8_t y, bool isStore)
++    inline void recordPtrWalk(uint16_t zp, uint8_t y, bool isStore, uint16_t pc)
 +    {
 +        if (!ramFn) return;
 +        const uint16_t ptr = (uint16_t)(ramFn(ramCtx, zp) |
@@ -1218,6 +1220,13 @@ index 00000000..8139e8fc
 +            {
 +                c.ptrVals.push_back(ptr);
 +                c.advFrame.push_back(frameNo);
++                // The Y index is the authored orderlist POSITION of this advance; the
++                // (zp),Y read PC distinguishes the consuming voice (each voice reads the
++                // shared orderlist at its own play-routine PC). Together they let the
++                // recovery collapse the per-voice/per-row read stream back to the single
++                // authored orderlist (the Y-walk) + its loop point (where Y wraps).
++                c.advY.push_back(y);
++                c.advPc.push_back(pc);
 +                c.nAdv++;
 +            }
 +            c.lastPtr = ptr;

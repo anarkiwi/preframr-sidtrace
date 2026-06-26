@@ -326,6 +326,12 @@ def parse_sdst(path):
                 off += 2 * nadv
                 frames = list(struct.unpack_from(f"<{nadv}I", buf, off))
                 off += 4 * nadv
+                # advY (u8) + advPc (u16): the authored orderlist POSITION and the
+                # consuming voice's read PC at each advance (appended after advFrame).
+                adv_y = list(struct.unpack_from(f"<{nadv}B", buf, off))
+                off += nadv
+                adv_pc = list(struct.unpack_from(f"<{nadv}H", buf, off))
+                off += 2 * nadv
                 ptr_walks.append(
                     {
                         "zp": zp,
@@ -336,6 +342,8 @@ def parse_sdst(path):
                         "count": count,
                         "ptr_vals": ptrs,
                         "adv_frames": frames,
+                        "adv_y": adv_y,
+                        "adv_pc": adv_pc,
                     }
                 )
         elif tag == b"RELO":
