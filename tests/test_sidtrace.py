@@ -643,8 +643,13 @@ def test_pwlk_full_length_advance_schedule(tmp_path, ptr_walk_sid):
         d = parse_sdst(Path(f"{prefix}.distill.bin"))
         assert d["ptr_walks"], "no PWLK pointer-walk captured"
         w = d["ptr_walks"][0]
-        # the on-disk arrays must agree with the advertised advance count.
+        # the on-disk arrays must agree with the advertised advance count -- including
+        # the new per-advance Y index (authored orderlist position) and consuming read PC.
         assert len(w["ptr_vals"]) == len(w["adv_frames"])
+        assert len(w["adv_y"]) == len(w["ptr_vals"])
+        assert len(w["adv_pc"]) == len(w["ptr_vals"])
+        # Y indices are bounded by the advertised y_max (the orderlist length).
+        assert all(0 <= y <= w["y_max"] for y in w["adv_y"])
         return w
 
     a = walk(tmp_path / "w300", 300)

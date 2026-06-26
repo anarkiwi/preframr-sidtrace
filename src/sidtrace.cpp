@@ -504,9 +504,18 @@ static long emit_distill(const char *path, MemBusTrace &tr,
     // consecutive equals -> advances) is the resolved orderlist->pattern stream;
     // advFrame[i] is the frame (play-call) index of advance i (the row/note
     // onset = item #6 tempo events); yMin/yMax is the per-call index range.
+    //
+    // advY[i] / advPc[i] (ADDITIVE, this revision): the Y index (the AUTHORED
+    // orderlist POSITION) and the (zp),Y read PC (the consuming voice proxy) of
+    // advance i. They let the recovery collapse the per-voice/per-row pointer-read
+    // stream back to the single authored orderlist (the Y-walk 0..yMax) + its loop
+    // point (where Y wraps), instead of the over-expanded per-onset read sequence.
+    // Appended AFTER the legacy arrays so an older reader that stops at advFrame
+    // parses the prefix unchanged (the trailing two arrays are the new tail).
     // Layout: tag "PWLK"; nentries u32; then per entry:
     //   zp u16, flags u8 (bit0=isLoad, bit1=isStore), yMin u8, yMax u8, _pad u8,
-    //   count u32, nAdv u16, then nAdv * (ptrVal u16), then nAdv * (advFrame u32).
+    //   count u32, nAdv u16, then nAdv * (ptrVal u16), then nAdv * (advFrame u32),
+    //   then nAdv * (advY u8), then nAdv * (advPc u16).
     {
         fwrite("PWLK", 1, 4, f);
         wr_u32(f, (uint32_t)tr.ptrWalks.size());
@@ -525,6 +534,8 @@ static long emit_distill(const char *path, MemBusTrace &tr,
             wr_u16(f, (uint16_t)c.nAdv);
             for (uint32_t i = 0; i < c.nAdv; ++i) wr_u16(f, c.ptrVals[i]);
             for (uint32_t i = 0; i < c.nAdv; ++i) wr_u32(f, c.advFrame[i]);
+            for (uint32_t i = 0; i < c.nAdv; ++i) wr_u8(f, c.advY[i]);
+            for (uint32_t i = 0; i < c.nAdv; ++i) wr_u16(f, c.advPc[i]);
         }
     }
 
