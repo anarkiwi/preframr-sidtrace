@@ -77,6 +77,17 @@ _TMPO_ENTRY = struct.Struct("<HBB")
 # instrument freq-table the freq-feeding IDXR PC walked (the freq-mod generator).
 _IWLK_HEAD = struct.Struct("<HBxI")
 
+# SETL (settle-detection + classification): a single fixed record.
+#  settle_found u8, structure_present u8, pad[2], settle_frame u32,
+#  n_steady_idx u32, n_steady_ptr u32, settle_hold u32, settle_cap u32
+_SETL_REC = struct.Struct("<BBxxIIIII")
+# SSTR (steady-state structure): post-settle table-access provenance.
+#  per indexed-read entry: pc u16, base u16, stride i32, idxMin u8, idxMax u8,
+#                          flags u8, pad u8, count u32, feedsRegMask u32
+_SSTR_IDX = struct.Struct("<HHiBBBxII")
+#  per pointer-walk entry: zp u16, pad u16, advCount u32
+_SSTR_PTR = struct.Struct("<HxxI")
+
 # Leaf kinds (mirror membus_trace.h LeafKind).
 LK_IMMEDIATE = 0
 LK_RAM_READ = 1
@@ -165,6 +176,9 @@ def parse_sdst(path):
     digi = None
     tempo_cands = []
     iwlk_walks = []
+    settle = None
+    steady_idx = []
+    steady_ptr = []
     while off < len(buf):
         tag = buf[off : off + 4]
         off += 4
@@ -408,6 +422,47 @@ def parse_sdst(path):
                 index = np.frombuffer(buf[off : off + nfr], dtype=np.uint8).copy()
                 off += nfr
                 iwlk_walks.append({"pc": pc, "voice": voice, "index": index})
+        elif tag == b"SETL":
+            found, present, frame, nidx, nptr, hold, cap = _SETL_REC.unpack_from(
+                buf, off
+            )
+            off += _SETL_REC.size
+            settle = {
+                "settle_found": bool(found),
+                "structure_present": bool(present),
+                "settle_frame": frame,
+                "n_steady_idx": nidx,
+                "n_steady_ptr": nptr,
+                "settle_hold": hold,
+                "settle_cap": cap,
+            }
+        elif tag == b"SSTR":
+            (nidx,) = struct.unpack_from("<I", buf, off)
+            off += 4
+            for _ in range(nidx):
+                pc, base, stride, imin, imax, flags, count, mask = (
+                    _SSTR_IDX.unpack_from(buf, off)
+                )
+                off += _SSTR_IDX.size
+                steady_idx.append(
+                    {
+                        "pc": pc,
+                        "base": base,
+                        "stride": stride,
+                        "idx_min": imin,
+                        "idx_max": imax,
+                        "targets_data": bool(flags & 1),
+                        "in_image": bool(flags & 2),
+                        "count": count,
+                        "feeds_reg_mask": mask,
+                    }
+                )
+            (nptr,) = struct.unpack_from("<I", buf, off)
+            off += 4
+            for _ in range(nptr):
+                zp, adv = _SSTR_PTR.unpack_from(buf, off)
+                off += _SSTR_PTR.size
+                steady_ptr.append({"zp": zp, "adv_count": adv})
         else:
             raise ValueError(f"unknown SDST section {tag!r}")
 
@@ -435,6 +490,9 @@ def parse_sdst(path):
         "digi": digi,
         "tempo_cands": tempo_cands,
         "iwlk_walks": iwlk_walks,
+        "settle": settle,
+        "steady_idx": steady_idx,
+        "steady_ptr": steady_ptr,
     }
 
 

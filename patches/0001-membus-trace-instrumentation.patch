@@ -254,10 +254,10 @@ index 691ab7f8..e82f4a3b 100644
          if (addr >= 0x0400 && addr <= 0x07ff)
 diff --git a/src/c64/membus_trace.h b/src/c64/membus_trace.h
 new file mode 100644
-index 00000000..3598f1f8
+index 00000000..18d5c315
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,1892 @@
+@@ -0,0 +1,2188 @@
 +/*
 + * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
 + * Not part of upstream libsidplayfp. Scratch use only.
@@ -764,6 +764,104 @@ index 00000000..3598f1f8
 +    bool     anyFrameStarted = false;
 +    uint32_t frameNo = 0;          // global play-call index (sampling boundaries)
 +
++    // ===================================================================
++    // SETTLE DETECTION (player-agnostic "observe and derive").
++    //
++    // A tune's first frames are INITIALISATION: the PSID driver runs the tune's
++    // init (depack / relocate / runtime table resolve), which executes one-shot
++    // relocation code and writes large amounts of CODE and DATA. Steady-state
++    // playback is reached once that work SATURATES: the per-frame code footprint
++    // stops growing and the player produces output on a fixed code loop.
++    //
++    // We detect the SETTLE FRAME as the first play-call that OPENS a window of
++    // SETTLE_HOLD consecutive frames in which ALL of the following hold:
++    //
++    //   (a) no write lands on a NEW executed-code byte -- the bulk code rewriting
++    //       of init/depack/relocation has ended. We track writes onto code by
++    //       NOVELTY (a code byte written for the FIRST time this run), NOT by raw
++    //       count: a steady self-modifying player (DefMon: `STA opnd` each call)
++    //       re-pokes the SAME operand bytes every frame, so it adds NO new
++    //       code-write addresses once running; a depacker/relocator writes fresh
++    //       code addresses each frame. Counting novelty is robust to the per-frame
++    //       value variation a literal-count test would choke on.
++    //   (b) no NEW PC is executed -- the player's code footprint has stopped
++    //       growing, i.e. it has entered its fixed per-frame loop. Tracked by
++    //       novelty over a play-phase exec-PC bitmap. This is robust to which
++    //       branch a frame takes: a note-trigger path adds its PCs the FIRST time
++    //       it runs and never again, so a steady tracker quickly reaches "no new
++    //       PC", whereas init/relocation code is one-shot and keeps adding PCs.
++    //   (c) the $D4xx SID-write cadence is PERIODIC -- the player produces output
++    //       every frame. We require a non-zero per-frame SID-write burst across the
++    //       window (a steady tracker writes a burst each frame; the COUNT varies
++    //       with note/gate events, so we require presence, not a constant count).
++    //
++    // All three are bounded per-frame integers; the detector keeps only the last
++    // SETTLE_HOLD frame summaries (a tiny ring) plus two flat 8 KiB bitmaps, so it
++    // is flat vs run length. If settle is never reached within SETTLE_CAP frames
++    // (continuous per-frame depacking, a digi streamer that re-runs fresh code, or
++    // an endlessly self-growing footprint) we record settleFound=false -- itself a
++    // classification signal the consumer routes on.
++    //
++    // Robustness: the novelty-saturation formulation tolerates a multi-frame depack
++    // (novelty keeps firing until it stops), hard-restart ramp-ups (the ramp adds
++    // PCs), and intro-vs-loop (an intro running a fixed loop legitimately IS steady
++    // playback; a later orderlist section reuses the SAME code, adding no new PCs --
++    // the orderlist DATA it reads changes, not the code).
++    static constexpr uint32_t SETTLE_HOLD = 8;     // consecutive stable frames required
++    static constexpr uint32_t SETTLE_CAP  = 6000;  // give up after this many play-calls
++
++    // Per-frame accumulators (reset at each frame boundary in foldFrameBoundary).
++    uint32_t curFrameNewPcs        = 0;  // PCs executed for the first time this frame
++    uint32_t curFrameNewCodeWrites = 0;  // first-time writes onto an EXEC byte
++    uint32_t curFrameSidWrites     = 0;  // $D4xx writes this frame
++
++    // Saturation bitmaps (flat vs run length): a play-phase exec-PC bitmap and a
++    // "written onto code" bitmap. 65536 bits = 8 KiB each. Novelty = a bit going
++    // 0->1; once both stop flipping the footprint has saturated (steady state).
++    uint8_t  execPcSeen[8192]   = {0};   // PC executed during play
++    uint8_t  codeWriteSeen[8192] = {0};  // an EXEC byte written during play
++
++    // Last SETTLE_HOLD frame summaries (a tiny ring; flat vs run length).
++    uint32_t fhNewPcs[SETTLE_HOLD]        = {0};
++    uint32_t fhNewCodeWrites[SETTLE_HOLD] = {0};
++    uint32_t fhSidWrites[SETTLE_HOLD]     = {0};
++    uint32_t fhCount = 0;              // frame summaries folded so far (saturating)
++
++    bool     settleFound = false;     // settle frame detected within the cap
++    uint32_t settleFrame = 0;         // frame index at which steady state began
++    bool     settleSnapshotTaken = false;  // RAM anchored at the settle frame
++
++    // STEADY-STATE STRUCTURE (post-settle table-access provenance). Only the table
++    // walks the PLAYROUTINE performs AFTER settle -- the runtime/post-relocation
++    // tables, not init-image operands. Same VSA shape as IDXR but accumulated only
++    // when settled. The CLASSIFICATION ("structure present?") is derived from this
++    // at emit time: a data-driven tracker indexes data-region tables in steady
++    // state; an algorithmic / computed-note tune (A Mind Is Born) does not.
++    // Keyed by issuing PC; O(code sites), flat vs run length.
++    struct SteadyIdx
++    {
++        uint64_t count = 0;
++        uint16_t base = 0;
++        int32_t  strideGuess = 0;
++        uint16_t lastAddr = 0;
++        uint8_t  idxMin = 0xff;
++        uint8_t  idxMax = 0;
++        bool     baseSet = false;
++        uint32_t feedsRegMask = 0;   // mirrored from the IDXR entry at emit time
++        bool     targetsData = false;// the swept addresses were READ AS DATA in play
++        bool     inImage = false;    // the table base lies in the LOADED IMAGE span
++                                     // (authored song data lives in the image; an
++                                     // algorithmic tune's generator state lives in
++                                     // scratch / zero page -- this is the key
++                                     // tracker-vs-computed discriminator)
++    };
++    std::map<uint16_t, SteadyIdx> idxSteady;
++    // Steady-state (zp),Y pointer-walk presence, keyed by zp pair: the count of
++    // pointer advances seen AFTER settle (the resolved orderlist->pattern walk of
++    // steady playback). A non-trivial post-settle advance count is a strong
++    // data-driven-tracker signal.
++    std::map<uint16_t, uint32_t> ptrSteadyAdv;
++
 +    // --- ring buffer of retired instructions (bounded backward-slice window) ---
 +    RetiredInstr ring[RING_CAP];
 +    uint32_t ringHead = 0;     // index of next slot to write
@@ -828,7 +926,24 @@ index 00000000..3598f1f8
 +        if (!enabled) return;
 +        const bool play = (phase == PHASE_PLAY);
 +        if (rw)
++        {
++            // SETTLE signal (a): a write that lands on an EXECUTED-CODE byte is
++            // relocation / depack / self-modification patching code or operands.
++            // We count NOVELTY -- a code byte written for the FIRST time this run --
++            // not the raw count: a steady SMC player re-pokes the SAME operands
++            // every frame (no novelty), a depacker writes fresh code each frame.
++            if (play && (acc[addr] & (ACC_EXEC_INIT | ACC_EXEC_PLAY)))
++            {
++                const uint16_t byte = addr >> 3;
++                const uint8_t bit = (uint8_t)(1u << (addr & 7));
++                if (!(codeWriteSeen[byte] & bit))
++                {
++                    codeWriteSeen[byte] |= bit;
++                    curFrameNewCodeWrites++;
++                }
++            }
 +            acc[addr] |= play ? ACC_WRITE_PLAY : ACC_WRITE_INIT;
++        }
 +        else
 +        {
 +            acc[addr] |= play ? ACC_READ_PLAY : ACC_READ_INIT;
@@ -913,6 +1028,20 @@ index 00000000..3598f1f8
 +    inline void beginInstr(uint16_t startPC)
 +    {
 +        if (!enabled) return;
++        // SETTLE signal (b): mark this instruction's start PC in the play-phase
++        // exec-PC bitmap and count a NOVELTY if it was not executed before. Once a
++        // frame adds no new PC, the player's code footprint has saturated (it is in
++        // its fixed per-frame loop) -- robust to which branch a frame takes.
++        if (phase == PHASE_PLAY)
++        {
++            const uint16_t byte = startPC >> 3;
++            const uint8_t bit = (uint8_t)(1u << (startPC & 7));
++            if (!(execPcSeen[byte] & bit))
++            {
++                execPcSeen[byte] |= bit;
++                curFrameNewPcs++;
++            }
++        }
 +        // Retire the previous instruction (if any) into the ring buffer.
 +        if (curValid && phase == PHASE_PLAY && cur.gotOpcode)
 +        {
@@ -1049,6 +1178,21 @@ index 00000000..3598f1f8
 +        lastSidWriteCycle = -1;
 +        anyFrameStarted = false;
 +        frameNo = 0;
++        // settle detection state
++        curFrameNewPcs = 0;
++        curFrameNewCodeWrites = 0;
++        curFrameSidWrites = 0;
++        std::memset(execPcSeen, 0, sizeof(execPcSeen));
++        std::memset(codeWriteSeen, 0, sizeof(codeWriteSeen));
++        std::memset(fhNewPcs, 0, sizeof(fhNewPcs));
++        std::memset(fhNewCodeWrites, 0, sizeof(fhNewCodeWrites));
++        std::memset(fhSidWrites, 0, sizeof(fhSidWrites));
++        fhCount = 0;
++        settleFound = false;
++        settleFrame = 0;
++        settleSnapshotTaken = false;
++        idxSteady.clear();
++        ptrSteadyAdv.clear();
 +        ringHead = 0;
 +        ringFill = 0;
 +        ringSeq = 0;
@@ -1061,6 +1205,62 @@ index 00000000..3598f1f8
 +    }
 +
 +private:
++    // Reset the per-frame settle accumulators for the next play-call.
++    inline void resetFrameAccumulators()
++    {
++        curFrameNewPcs = 0;
++        curFrameNewCodeWrites = 0;
++        curFrameSidWrites = 0;
++    }
++
++    // Fold the just-completed play-call's settle summary into the rolling window
++    // and run the settle test. Called at a frame boundary (the completed call's
++    // index is the current frameNo, before sampleStateCells advances it). Bounded:
++    // a tiny SETTLE_HOLD-entry ring, flat vs run length.
++    inline void foldFrameBoundary()
++    {
++        const uint32_t completedFrame = frameNo;
++        const uint32_t slot = fhCount % SETTLE_HOLD;
++        fhNewPcs[slot]        = curFrameNewPcs;
++        fhNewCodeWrites[slot] = curFrameNewCodeWrites;
++        fhSidWrites[slot]     = curFrameSidWrites;
++        fhCount++;
++        resetFrameAccumulators();
++
++        if (settleFound) return;
++        if (completedFrame >= SETTLE_CAP) return;   // gave up -- leave settleFound=false
++        if (fhCount < SETTLE_HOLD) return;          // not enough history yet
++
++        // Steady across the whole hold window: every frame added NO new executed
++        // PC (b), NO first-time code write (a), and produced a non-zero SID burst
++        // (c). The ring is full here (fhCount>=SETTLE_HOLD); slot order is
++        // irrelevant for an all-satisfy test.
++        bool stable = true;
++        for (uint32_t i = 0; i < SETTLE_HOLD && stable; ++i)
++        {
++            if (fhNewPcs[i] != 0)        stable = false;
++            if (fhNewCodeWrites[i] != 0) stable = false;
++            if (fhSidWrites[i] == 0)     stable = false;
++        }
++        if (!stable) return;
++
++        // Settle confirmed. The settle frame is the FIRST frame of the stable
++        // window: completedFrame is the last of the SETTLE_HOLD-frame window, so
++        // the window opened at completedFrame - (SETTLE_HOLD - 1).
++        settleFound = true;
++        settleFrame = (completedFrame >= (SETTLE_HOLD - 1))
++                          ? (completedFrame - (SETTLE_HOLD - 1)) : 0;
++        // Anchor the canonical resident image at the settle frame: the live RAM
++        // is now the unpacked / relocated / runtime-resolved steady-state image.
++        // Re-snapshot here so SNAP reflects the post-relocation bases (NOT the
++        // static load image). Done in-emulator, deterministic.
++        if (ramFn)
++        {
++            snapshotRam();
++            settleSnapshotTaken = true;
++        }
++    }
++
 +    inline void recordSidWrite(uint16_t addr, uint8_t val)
 +    {
 +        if (firstSidWriteCycle < 0 && phase == PHASE_PLAY)
@@ -1074,6 +1274,12 @@ index 00000000..3598f1f8
 +            if (!anyFrameStarted ||
 +                (lastSidWriteCycle >= 0 && (t - lastSidWriteCycle) > FRAME_GAP_CYCLES))
 +            {
++                // The prior play-call is complete. Fold its settle summary BEFORE
++                // sampleStateCells advances frameNo, so the settle frame index is on
++                // the same grid as STSQ/PWLK. The first boundary has no completed
++                // prior frame (its accumulators are the init tail) -- skip its fold.
++                if (anyFrameStarted) foldFrameBoundary();
++                else resetFrameAccumulators();
 +                sampleStateCells();
 +                anyFrameStarted = true;
 +                // DIGI density (item #4): the prior frame's $D418 burst is done;
@@ -1084,6 +1290,7 @@ index 00000000..3598f1f8
 +            }
 +            lastSidWriteCycle = t;
 +            if ((addr & 0x1f) == 0x18) curFrameD418++;
++            curFrameSidWrites++;
 +        }
 +        const uint8_t reg = (uint8_t)(addr & 0x1f);
 +        SidWrSummary &s = sidWrites[((uint32_t)pc() << 5) | reg];
@@ -1120,6 +1327,36 @@ index 00000000..3598f1f8
 +        if (idx < s.idxMin) s.idxMin = idx;
 +        if (idx > s.idxMax) s.idxMax = idx;
 +        s.count++;
++        // STEADY-STATE STRUCTURE: accumulate the VSA but only AFTER settle -- the
++        // tables the playroutine indexes during steady playback (runtime /
++        // post-relocation bases, not init-image operands). Keyed by issuing PC.
++        //
++        // Use the OPCODE'S ACTUAL index register (not the legacy max(x,y) the IDXR
++        // fields keep for byte-compat), restricted to DIRECT indexed modes where
++        // addr = base + index is genuinely affine -- so the recovered base is the
++        // true RUNTIME table base. The legacy max(x,y) mis-attributes the base when
++        // the other index register holds a large stale value; the steady-structure
++        // base must be correct (it is the post-relocation address the recovery
++        // reads), so we compute it from the right register here.
++        if (settleFound && !(pendingFetch && addr == pendingFetchAddr) &&
++            curValid && cur.gotOpcode && isDirectIndexed(cur.opcode))
++        {
++            const uint8_t diu = indexRegFor(cur.opcode);
++            const uint8_t sidx = (diu == SR_X) ? x : (diu == SR_Y) ? y : 0;
++            const uint16_t sbase = (uint16_t)(addr - sidx);
++            SteadyIdx &ss = idxSteady[p];
++            if (!ss.baseSet) { ss.base = sbase; ss.baseSet = true; }
++            if (ss.count)
++            {
++                const int32_t d = (int32_t)addr - (int32_t)ss.lastAddr;
++                if (d != 0 && (ss.strideGuess == 0 || (d > 0 && d < ss.strideGuess)))
++                    ss.strideGuess = d;
++            }
++            ss.lastAddr = addr;
++            if (sidx < ss.idxMin) ss.idxMin = sidx;
++            if (sidx > ss.idxMax) ss.idxMax = sidx;
++            ss.count++;
++        }
 +        // SCALED-INDEX samples (item #1): record up to two DISTINCT-index
 +        // (idxVal, effAddr) samples USING THE OPCODE'S ACTUAL INDEX REGISTER, so
 +        // finalizeOffload can fit scale=(a1-a0)/(i1-i0), base=a0-scale*i0. This
@@ -1231,6 +1468,10 @@ index 00000000..3598f1f8
 +            }
 +            c.lastPtr = ptr;
 +            c.haveLast = true;
++            // STEADY-STATE STRUCTURE: count orderlist->pattern advances that occur
++            // AFTER settle -- the resolved pointer-walk of steady playback (a
++            // strong data-driven-tracker signal).
++            if (settleFound) ptrSteadyAdv[zp]++;
 +        }
 +    }
 +
@@ -2143,6 +2384,61 @@ index 00000000..3598f1f8
 +                }
 +            }
 +        }
++        // STEADY-STATE STRUCTURE finalize: mirror each steady table walk's
++        // feedsRegMask from the (whole-run) IDXR entry of the same PC, and decide
++        // whether the swept addresses were READ AS DATA during play (a table over
++        // a real data region, not a stray scratch index). Deterministic; depends
++        // only on the accumulated state.
++        for (auto &kv : idxSteady)
++        {
++            SteadyIdx &ss = kv.second;
++            auto it = idxReads.find(kv.first);
++            if (it != idxReads.end()) ss.feedsRegMask = it->second.feedsRegMask;
++            // inImage: the table base lies in the loaded image span. Authored
++            // tracker tables (orderlist / pattern / instrument) live in the image;
++            // an algorithmic tune's generator state lives in zero page / scratch.
++            ss.inImage = (loadHi > loadLo) && (ss.base >= loadLo && ss.base < loadHi);
++            // targetsData: any address in the swept range [base+idxMin, base+idxMax]
++            // is marked READ_PLAY (read as data during play). Bounded scan.
++            const int lo = ss.idxMin == 0xff ? 0 : ss.idxMin;
++            const int hi = ss.idxMax;
++            for (int i = lo; i <= hi && i <= 255; ++i)
++            {
++                const int32_t ea = (int32_t)ss.base + i;
++                if (ea < 0 || ea > 0xffff) continue;
++                if (acc[ea] & ACC_READ_PLAY) { ss.targetsData = true; break; }
++            }
++        }
++    }
++
++    // STEADY-STATE STRUCTURE CLASSIFICATION: does the player perform indexed
++    // table-walks over authored DATA in steady state (data-driven tracker) -- or
++    // not (algorithmic / computed-note tune, e.g. A Mind Is Born, or a digi)?
++    // A consumer routes tracker-recovery vs generator-fit/cover-fallback on this.
++    //
++    // structure_present iff, post-settle, there is at least one indexed table walk
++    // that (i) sweeps a non-trivial range (STRUCTURE_MIN_SPAN entries), (ii) over a
++    // region read as DATA during play, AND (iii) whose base lies in the LOADED
++    // IMAGE. Clause (iii) is the decisive tracker-vs-computed test: authored
++    // orderlist/pattern/instrument tables live in the image, whereas an algorithmic
++    // tune (A Mind Is Born) relocates its tiny generator state into ZERO PAGE and
++    // computes notes -- its steady indexed reads are over zp/scratch, NOT the image,
++    // so it correctly classifies as NO authored structure. A (zp),Y pointer walk
++    // ALONE is not sufficient: a generator can churn a zp pointer pair every
++    // iteration (A Mind advances one ~274x/frame), which is per-iteration generator
++    // state, not an authored orderlist -- so the in-image indexed-table test is the
++    // primary signal.
++    static constexpr int STRUCTURE_MIN_SPAN = 4;   // distinct table entries swept
++    bool steadyStructurePresent() const
++    {
++        for (const auto &kv : idxSteady)
++        {
++            const SteadyIdx &ss = kv.second;
++            const int span = (int)ss.idxMax - (int)(ss.idxMin == 0xff ? 0 : ss.idxMin) + 1;
++            if (span >= STRUCTURE_MIN_SPAN && ss.targetsData && ss.inImage)
++                return true;
++        }
++        return false;
 +    }
 +
 +};
