@@ -254,10 +254,10 @@ index 691ab7f8..e82f4a3b 100644
          if (addr >= 0x0400 && addr <= 0x07ff)
 diff --git a/src/c64/membus_trace.h b/src/c64/membus_trace.h
 new file mode 100644
-index 00000000..fa62c022
+index 00000000..6e9d2266
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,2731 @@
+@@ -0,0 +1,3052 @@
 +/*
 + * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
 + * Not part of upstream libsidplayfp. Scratch use only.
@@ -699,6 +699,51 @@ index 00000000..fa62c022
 +    std::vector<SiddfLeaf> leaves;    // predicate slice (state_cell / ram / immediate)
 +};
 +
++// --- SDIR (faithful generator-IR; design generator-ir-design.md section 4) ----
++// The ordered-SSA micro-IR for ONE store site (variant). Where SDCU emits an
++// unordered op-ENVELOPE + a leaf union, SDIR emits the EXACT straight-line
++// program the executed frame ran: one SSA node per ALU op, in execution order
++// (recovered from RetiredInstr.ringSeq), with fully-resolved operands. The
++// recurrence self-edge is a first-class Prior(cell); an indexed song-data read
++// is Mem(base, mode, index_cell, klass=TABLE) with the cursor as a named input;
++// a value an earlier sliced node produced this frame is Node(id). The body stops
++// at PERSISTENT generator cells (emitted as Mem/Prior operands), so each
++// generator's multi-term structure lives in its own body, joined by operand
++// edges -- never inlined across generators.
++enum IrOpndTag : uint8_t { IO_IMM = 0, IO_MEM = 1, IO_PRIOR = 2, IO_NODE = 3 };
++enum IrMode : uint8_t
++{
++    IM_ABS = 0, IM_ABS_X, IM_ABS_Y, IM_ZP, IM_ZP_X, IM_IND_Y, IM_NONE = 0xff
++};
++enum IrKlass : uint8_t { IK_SONG_DATA = 0, IK_TABLE, IK_SCRATCH, IK_IO };
++// Op extends AluOp with the value-carrying load and the sign-extend/carry
++// helpers (kept distinct so the schema is self-describing; LOAD == ALU_NONE).
++enum IrExtraOp : uint8_t
++{
++    IR_OP_LOAD = 13, IR_OP_NEG_IF_BIT7 = 14, IR_OP_CARRY = 15
++};
++
++struct IrOperand
++{
++    uint8_t  tag = IO_IMM;     // IrOpndTag
++    int32_t  imm = 0;          // IO_IMM constant
++    uint16_t base = 0;         // IO_MEM base address (effective addr - index)
++    uint8_t  mode = IM_NONE;   // IO_MEM addressing mode
++    uint16_t indexCell = 0;    // IO_MEM index register's source cell (0 = none)
++    uint8_t  width = 1;        // IO_MEM access width
++    uint8_t  klass = IK_SONG_DATA; // IO_MEM post-settle classification (advisory)
++    uint16_t cell = 0;         // IO_PRIOR cell address
++    uint16_t node = 0;         // IO_NODE SSA id
++    uint8_t  value = 0;        // observed value at capture (advisory)
++};
++
++struct IrNode
++{
++    uint8_t  op = IR_OP_LOAD;  // AluOp / IrExtraOp
++    uint8_t  carryIn = 0;      // ADC/SBC carry-in (0/1; 2 = unknown)
++    std::vector<IrOperand> args;
++};
++
 +struct CellVariant
 +{
 +    uint16_t storePc = 0;             // the STA/STX/STY/RMW site (the variant id)
@@ -706,6 +751,10 @@ index 00000000..fa62c022
 +    std::vector<Guard> guards;        // innermost first, bounded MAX_GUARDS
 +    uint32_t count = 0;               // frames this variant fired (provenance)
 +    bool     guardsCaptured = false;  // guard chain sliced once (first occurrence)
++    // --- SDIR ordered-SSA body for this variant (captured once, first frame) ---
++    std::vector<IrNode> irNodes;      // ordered SSA, execution order
++    uint16_t irStoreNode = 0xffff;    // node id whose result is stored (0xffff = none)
++    bool     irCaptured = false;      // body sliced (first occurrence)
 +};
 +
 +struct CellUpdate
@@ -1837,6 +1886,21 @@ index 00000000..fa62c022
 +        return false;
 +    }
 +
++    // The register an opcode reads as a CARRIED input (the result depends on the
++    // prior value of that register): A for binary ALU / accumulator-shifts (see
++    // aluReadsAcc), X for INX/DEX, Y for INY/DEY. SR_NONE for plain loads /
++    // transfers / memory-RMW (which overwrite or operate on memory, not a reg).
++    static inline uint8_t carriedReg(uint8_t op)
++    {
++        if (aluReadsAcc(op)) return SR_A;
++        switch (op)
++        {
++        case 0xE8: case 0xCA: return SR_X;   // INX / DEX
++        case 0xC8: case 0x88: return SR_Y;   // INY / DEY
++        }
++        return SR_NONE;
++    }
++
 +    // Which index register an opcode's effective address uses (indexed modes).
 +    static inline uint8_t indexRegFor(uint8_t op)
 +    {
@@ -2225,6 +2289,18 @@ index 00000000..fa62c022
 +        if (s.count > 1) return;             // op + leaf are invariant; record once
 +        if (op != ALU_NONE && s.opSeq.size() < 32) s.opSeq.push_back(op);
 +        addLeaf(s, LK_RAM_READ, cellAddr, ramFn ? ramFn(ramCtx, cellAddr) : 0);
++        // SDIR: the in-place RMW is the self-feedback recurrence cell' = op(cell);
++        // one node, op on Prior(cell).
++        if (!vp->irCaptured)
++        {
++            vp->irCaptured = true;
++            IrNode nd; nd.op = op;
++            IrOperand pr; pr.tag = IO_PRIOR; pr.cell = cellAddr;
++            pr.value = ramFn ? ramFn(ramCtx, cellAddr) : 0;
++            nd.args.push_back(pr);
++            vp->irNodes.push_back(nd);
++            vp->irStoreNode = 0;
++        }
 +    }
 +
 +    inline void sliceCellUpdate(uint32_t storeSlot, uint16_t cellAddr)
@@ -2364,6 +2440,251 @@ index 00000000..fa62c022
 +        // path (innermost first, bounded). Recorded once with the value slice.
 +        captureGuards(*vp, storeSlot);
 +        vp->guardsCaptured = true;
++        // SDIR: capture the faithful ordered-SSA body of this single executed
++        // frame (the register def-chain, stopping at persistent cells / song
++        // data). Recorded once, alongside the guards.
++        captureIr(storeSlot, cellAddr, *vp);
++    }
++
++    // ----- SDIR helpers (design generator-ir-design.md section 4c) ------------
++    // Is `addr` a PERSISTENT state/generator cell -- a cell written during play
++    // and read or executed during play (a zp/ram accumulator, cursor, counter,
++    // or self-modified operand)? A generator body STOPS at such a cell, emitting
++    // it as a Mem/Prior operand rather than inlining its producer; each cell's
++    // own multi-term structure lives in its own generator body.
++    inline bool isPersistentCell(uint16_t addr) const
++    {
++        if (addr >= 0xD400 && addr <= 0xD7FF) return false;
++        const uint8_t b = acc[addr];
++        const bool wr = b & ACC_WRITE_PLAY;
++        const bool rd = b & ACC_READ_PLAY;
++        const bool ex = b & (ACC_EXEC_INIT | ACC_EXEC_PLAY);
++        return wr && (rd || ex);
++    }
++
++    // Addressing mode of a memory operand (advisory): the index register plus a
++    // zero-page/absolute split by the base magnitude.
++    inline uint8_t irModeFor(const RetiredInstr &in) const
++    {
++        if (isIndIndexed(in.opcode)) return IM_IND_Y;
++        const uint16_t b = (in.idxUsed != SR_NONE) ? in.idxBase : in.memAddr;
++        const bool zp = b < 0x100;
++        if (in.idxUsed == SR_X) return zp ? IM_ZP_X : IM_ABS_X;
++        if (in.idxUsed == SR_Y) return IM_ABS_Y;
++        return zp ? IM_ZP : IM_ABS;
++    }
++
++    // Post-settle class of a memory operand at effective base `base`.
++    inline uint8_t irKlassFor(uint16_t base, bool indexed) const
++    {
++        if (base >= 0xD400 && base <= 0xD7FF) return IK_IO;
++        const uint8_t k = classifyLeaf(base);
++        if (k == LK_STATE_CELL || k == LK_EXOGENOUS) return IK_SCRATCH;
++        return indexed ? IK_TABLE : IK_SONG_DATA;   // song-data: table vs scalar
++    }
++
++    // Resolve the SOURCE CELL of an index register as of ring slot `slot`: the
++    // nearest earlier instruction that defined the index reg via a memory load --
++    // its effective address is the live cursor cell. 0 if loaded by INX/imm.
++    inline uint16_t resolveIndexCell(uint32_t slot, uint8_t idxReg,
++                                     uint32_t windowLen) const
++    {
++        uint8_t need = idxReg;
++        uint32_t idx = slot;
++        for (uint32_t s = 0; s < windowLen; ++s)
++        {
++            idx = (idx == 0) ? (RING_CAP - 1) : (idx - 1);
++            const RetiredInstr &in = ring[idx];
++            if (!in.gotOpcode) continue;
++            const uint8_t dr = defReg(in.opcode);
++            if (dr != need && !(need == SR_X && alsoDefsX(in.opcode))) continue;
++            if (readsMem(in.opcode) && in.memRead) return in.memAddr;
++            switch (in.opcode)
++            {
++            case 0x8A: need = SR_X; break;   // TXA
++            case 0x98: need = SR_Y; break;   // TYA
++            case 0xAA: case 0xA8: need = SR_A; break;  // TAX/TAY
++            default: return 0;               // INX/imm/etc: no single source cell
++            }
++        }
++        return 0;
++    }
++
++    // The carry-in of an ADC/SBC at ring slot `slot`: scan back to the nearest
++    // CLC (0)/SEC (1); a different carry-defining op first => unknown (2).
++    inline uint8_t carryInFor(uint32_t slot, uint32_t windowLen) const
++    {
++        uint32_t idx = slot;
++        for (uint32_t s = 0; s < windowLen; ++s)
++        {
++            idx = (idx == 0) ? (RING_CAP - 1) : (idx - 1);
++            const RetiredInstr &in = ring[idx];
++            if (!in.gotOpcode) continue;
++            if (in.opcode == 0x18) return 0;   // CLC
++            if (in.opcode == 0x38) return 1;   // SEC
++            if (setsC(in.opcode))  return 2;   // earlier carry producer (unknown)
++        }
++        return 2;
++    }
++
++    // Build the resolved operand for a memory read at ring slot `slot`.
++    inline IrOperand memOperand(uint32_t slot, const RetiredInstr &in,
++                                uint16_t cellAddr, uint32_t windowLen) const
++    {
++        IrOperand o;
++        const uint16_t ea = in.memAddr;
++        if (ea == cellAddr)            // the recurrence self-edge
++        {
++            o.tag = IO_PRIOR; o.cell = cellAddr;
++            o.value = ramFn ? ramFn(ramCtx, ea) : 0;
++            return o;
++        }
++        const bool indexed = (in.idxUsed != SR_NONE);
++        o.tag = IO_MEM;
++        o.base = indexed ? in.idxBase : ea;
++        o.mode = irModeFor(in);
++        o.width = 1;
++        o.klass = irKlassFor(o.base, indexed);
++        o.value = ramFn ? ramFn(ramCtx, ea) : in.memVal;
++        if (indexed) o.indexCell = resolveIndexCell(slot, in.idxUsed, windowLen);
++        return o;
++    }
++
++    // Find the SSA id of the nearest contributing definition of register `reg`
++    // strictly before retirement sequence `beforeSeq`.
++    static inline bool nodeDefBefore(const std::map<uint64_t, uint32_t> &contrib,
++                                     const std::map<uint64_t, uint16_t> &seqToId,
++                                     const RetiredInstr *ring, uint8_t reg,
++                                     uint64_t beforeSeq, uint16_t &outId)
++    {
++        for (auto it = contrib.rbegin(); it != contrib.rend(); ++it)
++        {
++            if (it->first >= beforeSeq) continue;
++            const RetiredInstr &p = ring[it->second];
++            if (defReg(p.opcode) == reg ||
++                (reg == SR_X && alsoDefsX(p.opcode)))
++            {
++                outId = seqToId.at(it->first);
++                return true;
++            }
++        }
++        return false;
++    }
++
++    // ----- SDIR: faithful ordered-SSA body for one store variant --------------
++    // Mirror the SDCU value walk, but emit one SSA node per executed register-
++    // defining ALU/load in EXECUTION ORDER (recovered from ringSeq) with fully
++    // resolved operands. Memory reads are leaves (Prior for the self-edge, Mem
++    // otherwise); recursion follows only register def-chains (the carried
++    // accumulator and transfers), so multi-term register arithmetic
++    // (LDA/AND/ASL/ADC ...) is captured as an ordered DAG while the body stops at
++    // persistent cells and song data -- the cross-generator edges are operands.
++    inline void captureIr(uint32_t storeSlot, uint16_t cellAddr, CellVariant &var)
++    {
++        if (var.irCaptured) return;
++        var.irCaptured = true;
++        const RetiredInstr st = ring[storeSlot];
++        const uint32_t windowLen = ringFill < RING_CAP ? ringFill : RING_CAP;
++
++        // Pass 1: collect contributing register-def slots (ringSeq -> slot).
++        std::map<uint64_t, uint32_t> contrib;
++        struct RTask { uint32_t anchor; uint8_t reg; };
++        RTask wl[64]; uint32_t head = 0, tail = 0;
++        auto push = [&](uint32_t a, uint8_t r) {
++            if (tail < 64 && r != SR_NONE) wl[tail++] = RTask{ a, r };
++        };
++        push(storeSlot, storeSrcReg(st.opcode));
++        uint32_t resolved = 0;
++        while (head < tail && resolved < 256)
++        {
++            RTask tk = wl[head++]; ++resolved;
++            uint32_t idx = tk.anchor;
++            for (uint32_t s = 0; s < windowLen; ++s)
++            {
++                idx = (idx == 0) ? (RING_CAP - 1) : (idx - 1);
++                const RetiredInstr &in = ring[idx];
++                if (!in.gotOpcode) continue;
++                const uint8_t dr = defReg(in.opcode);
++                const bool defs = (dr == tk.reg) ||
++                                  (tk.reg == SR_X && alsoDefsX(in.opcode));
++                if (!defs) continue;
++                contrib[in.ringSeq] = idx;
++                const uint8_t cr = carriedReg(in.opcode);       // carried input reg
++                if (cr != SR_NONE) push(idx, cr);
++                switch (in.opcode)                              // transfers
++                {
++                case 0x8A: push(idx, SR_X); break;
++                case 0x98: push(idx, SR_Y); break;
++                case 0xAA: case 0xA8: push(idx, SR_A); break;
++                }
++                break;
++            }
++        }
++        if (contrib.empty()) return;
++
++        // Pass 2: SSA-number in execution order; resolve each node's operands.
++        std::map<uint64_t, uint16_t> seqToId;
++        uint16_t id = 0;
++        for (const auto &kv : contrib) seqToId[kv.first] = id++;
++        var.irNodes.assign(contrib.size(), IrNode{});
++        for (const auto &kv : contrib)
++        {
++            const uint32_t slot = kv.second;
++            const RetiredInstr &in = ring[slot];
++            IrNode &nd = var.irNodes[seqToId[kv.first]];
++            const uint8_t alu = aluOp(in.opcode);
++            nd.op = (alu == ALU_NONE) ? IR_OP_LOAD : alu;
++            const uint8_t cr = carriedReg(in.opcode);   // carried input => first arg
++            if (cr != SR_NONE)
++            {
++                uint16_t aid = 0;
++                if (nodeDefBefore(contrib, seqToId, ring, cr, in.ringSeq, aid))
++                {
++                    IrOperand a; a.tag = IO_NODE; a.node = aid;
++                    nd.args.push_back(a);
++                }
++            }
++            if (readsMem(in.opcode) && (in.memRead || in.memWrite))
++            {
++                nd.args.push_back(memOperand(slot, in, cellAddr, windowLen));
++            }
++            else if (in.hasImm)
++            {
++                IrOperand im;
++                if (in.immAddr && isSmcOperandCandidate(in.immAddr))
++                {
++                    im.tag = IO_MEM; im.base = in.immAddr; im.mode = IM_NONE;
++                    im.klass = IK_SCRATCH;
++                    im.value = ramFn ? ramFn(ramCtx, in.immAddr) : in.imm;
++                }
++                else { im.tag = IO_IMM; im.imm = in.imm; im.value = in.imm; }
++                nd.args.push_back(im);
++            }
++            else   // pure transfer: source register => Node arg
++            {
++                uint8_t srcr = SR_NONE;
++                switch (in.opcode)
++                {
++                case 0x8A: srcr = SR_X; break;
++                case 0x98: srcr = SR_Y; break;
++                case 0xAA: case 0xA8: srcr = SR_A; break;
++                }
++                uint16_t sid = 0;
++                if (srcr != SR_NONE &&
++                    nodeDefBefore(contrib, seqToId, ring, srcr, in.ringSeq, sid))
++                {
++                    IrOperand a; a.tag = IO_NODE; a.node = sid;
++                    nd.args.push_back(a);
++                }
++            }
++            if (alu == ALU_ADC || alu == ALU_SBC)
++                nd.carryIn = carryInFor(slot, windowLen);
++        }
++        // The stored value is the nearest contributing def of the store's source.
++        uint16_t sid = 0;
++        if (nodeDefBefore(contrib, seqToId, ring, storeSrcReg(st.opcode),
++                          st.ringSeq, sid))
++            var.irStoreNode = sid;
 +    }
 +
 +    // ----- SDCU guards: control-dependence approximation (design 3.2) ---------

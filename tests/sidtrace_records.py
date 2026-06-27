@@ -139,6 +139,23 @@ ALU_NAME = {
     12: "CMP",
 }
 
+# SDIR ordered-SSA op names (AluOp + IrExtraOp; mirror membus_trace.h).
+IR_OP_NAME = dict(ALU_NAME)
+IR_OP_NAME.update({13: "LOAD", 14: "NEG_IF_BIT7", 15: "CARRY"})
+
+# SDIR operand tags / addressing modes / klasses (mirror membus_trace.h).
+IO_IMM, IO_MEM, IO_PRIOR, IO_NODE = range(4)
+IR_MODE_NAME = {
+    0: "ABS",
+    1: "ABS_X",
+    2: "ABS_Y",
+    3: "ZP",
+    4: "ZP_X",
+    5: "IND_Y",
+    0xFF: "NONE",
+}
+IR_KLASS_NAME = {0: "SONG_DATA", 1: "TABLE", 2: "SCRATCH", 3: "IO"}
+
 # Guard comparison kinds (mirror membus_trace.h CmpOp). The SEMANTIC predicate
 # that holds when a guarded SDCU variant's store fires.
 (
@@ -177,6 +194,129 @@ _SDCU_GUARD = struct.Struct("<BBBB")
 
 def load_sidwr(path):
     return np.fromfile(path, dtype=SIDWR_DT)
+
+
+def _parse_sdir_operand(buf, off):
+    """Parse one SDIR tagged operand. Returns ``(operand_dict, new_offset)``."""
+    (tag,) = struct.unpack_from("<B", buf, off)
+    off += 1
+    if tag == IO_IMM:
+        (imm,) = struct.unpack_from("<i", buf, off)
+        off += 4
+        return {"tag": "Imm", "imm": imm}, off
+    if tag == IO_MEM:
+        base, mode, index_cell, width, klass, value = struct.unpack_from(
+            "<HBHBBB", buf, off
+        )
+        off += 8
+        return (
+            {
+                "tag": "Mem",
+                "base": base,
+                "mode": IR_MODE_NAME.get(mode, "?"),
+                "mode_raw": mode,
+                "index_cell": index_cell,
+                "width": width,
+                "klass": IR_KLASS_NAME.get(klass, "?"),
+                "klass_raw": klass,
+                "value": value,
+            },
+            off,
+        )
+    if tag == IO_PRIOR:
+        cell, value = struct.unpack_from("<HB", buf, off)
+        off += 3
+        return {"tag": "Prior", "cell": cell, "value": value}, off
+    if tag == IO_NODE:
+        (node,) = struct.unpack_from("<H", buf, off)
+        off += 2
+        return {"tag": "Node", "node": node}, off
+    raise ValueError(f"bad SDIR operand tag {tag}")
+
+
+def _parse_sdir_gen(buf, off):
+    """Parse one SDIR generator (a state cell's faithful ordered-SSA program).
+
+    Returns ``(gen_dict, new_offset)``. The generator carries its post-settle
+    ``init`` seed, the ``tables`` any ``Mem(TABLE)`` operand reads (base/stride/
+    bytes), and the observed ``variants``; each variant is an ordered SSA
+    ``body`` (one node per executed ALU/load, execution order) plus the evaluable
+    ``guards`` (reused from SDCU) and the ``store_node`` whose result is written.
+    """
+    cell, dest_width, init, nvar = struct.unpack_from("<HBBB", buf, off)
+    off += 5
+    (ntab,) = struct.unpack_from("<H", buf, off)
+    off += 2
+    tables = []
+    for _ in range(ntab):
+        base, stride, length = struct.unpack_from("<HBH", buf, off)
+        off += 5
+        data = list(buf[off : off + length])
+        off += length
+        tables.append({"base": base, "stride": stride, "bytes": data})
+    variants = []
+    for _ in range(nvar):
+        store_pc, store_node = struct.unpack_from("<HH", buf, off)
+        off += 4
+        (nguards,) = struct.unpack_from("<B", buf, off)
+        off += 1
+        guards = []
+        for _ in range(nguards):
+            cmp_op, sense, imm, gflags = _SDCU_GUARD.unpack_from(buf, off)
+            off += _SDCU_GUARD.size
+            (gnl,) = struct.unpack_from("<H", buf, off)
+            off += 2
+            gleaves = []
+            for _ in range(gnl):
+                kind, addr, value = _SIDDF_LEAF.unpack_from(buf, off)
+                off += _SIDDF_LEAF.size
+                gleaves.append((kind, addr, value))
+            guards.append(
+                {
+                    "cmp": cmp_op,
+                    "cmp_name": CMP_NAME.get(cmp_op, "?"),
+                    "sense": sense,
+                    "imm": imm,
+                    "unresolved": bool(gflags & 1),
+                    "leaves": gleaves,
+                }
+            )
+        (nnodes,) = struct.unpack_from("<H", buf, off)
+        off += 2
+        body = []
+        for _ in range(nnodes):
+            op, carry_in, nargs = struct.unpack_from("<BBB", buf, off)
+            off += 3
+            args = []
+            for _ in range(nargs):
+                operand, off = _parse_sdir_operand(buf, off)
+                args.append(operand)
+            body.append(
+                {
+                    "op": IR_OP_NAME.get(op, "?"),
+                    "op_raw": op,
+                    "carry_in": carry_in,
+                    "args": args,
+                }
+            )
+        variants.append(
+            {
+                "store_pc": store_pc,
+                "store_node": store_node,
+                "guards": guards,
+                "body": body,
+            }
+        )
+    return (
+        {
+            "cell": cell,
+            "dest_width": dest_width,
+            "init": init,
+            "tables": tables,
+            "variants": variants,
+        },
+        off,
+    )
 
 
 def _parse_siddf_entry(buf, off):
@@ -271,6 +411,7 @@ def parse_sdst(path):
     siddf = []
     stateseq = []
     sdcu = []
+    sdir = []
     idx_supp = []
     ptr_walks = []
     relo_copies = []
@@ -563,6 +704,12 @@ def parse_sdst(path):
                         {"frame": frame, "freq": freq, "ctrl": ctrl, "gate": gate}
                     )
                 voice_events.append({"voice": voice, "events": events})
+        elif tag == b"SDIR":
+            (nent,) = struct.unpack_from("<I", buf, off)
+            off += 4
+            for _ in range(nent):
+                gen, off = _parse_sdir_gen(buf, off)
+                sdir.append(gen)
         else:
             raise ValueError(f"unknown SDST section {tag!r}")
 
@@ -583,6 +730,7 @@ def parse_sdst(path):
         "siddf": siddf,
         "stateseq": stateseq,
         "sdcu": sdcu,
+        "sdir": sdir,
         "idx_supp": idx_supp,
         "ptr_walks": ptr_walks,
         "relo_copies": relo_copies,
