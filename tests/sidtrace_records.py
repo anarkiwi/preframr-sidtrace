@@ -139,9 +139,106 @@ ALU_NAME = {
     12: "CMP",
 }
 
+# Guard comparison kinds (mirror membus_trace.h CmpOp). The SEMANTIC predicate
+# that holds when a guarded SDCU variant's store fires.
+(
+    CMP_NONE,
+    CMP_EQ,
+    CMP_NE,
+    CMP_LT,
+    CMP_GE,
+    CMP_MI,
+    CMP_PL,
+    CMP_BIT_SET,
+    CMP_BIT_CLR,
+    CMP_VS,
+    CMP_VC,
+    CMP_UNRESOLVED,
+) = range(12)
+CMP_NAME = {
+    0: "NONE",
+    1: "EQ",
+    2: "NE",
+    3: "LT",
+    4: "GE",
+    5: "MI",
+    6: "PL",
+    7: "BIT_SET",
+    8: "BIT_CLR",
+    9: "VS",
+    10: "VC",
+    11: "UNRESOLVED",
+}
+
+# SDCU guard header (design 3): cmpOp u8, sense u8, immediate u8, flags u8
+# (bit0 = unresolved), then nLeaves u16 + nLeaves leaf records.
+_SDCU_GUARD = struct.Struct("<BBBB")
+
 
 def load_sidwr(path):
     return np.fromfile(path, dtype=SIDWR_DT)
+
+
+def _parse_siddf_entry(buf, off):
+    """Parse one SDDF-shaped data-flow entry (also the SDCU variant value body).
+
+    Returns ``(entry_dict, new_offset)``. The leading head's ``pc`` slot is the
+    code site for SDDF and the variant's store PC for SDCU."""
+    (
+        pc,
+        reg,
+        flags,
+        count,
+        vlo,
+        vhi,
+        vfirst,
+        sbase,
+        sstep,
+        simin,
+        simax,
+    ) = _SIDDF_HEAD.unpack_from(buf, off)
+    off += _SIDDF_HEAD.size
+    (npcs,) = struct.unpack_from("<H", buf, off)
+    off += 2
+    pcs = list(struct.unpack_from(f"<{npcs}H", buf, off))
+    off += 2 * npcs
+    (nleaves,) = struct.unpack_from("<H", buf, off)
+    off += 2
+    leaves = []
+    for _ in range(nleaves):
+        kind, addr, value = _SIDDF_LEAF.unpack_from(buf, off)
+        off += _SIDDF_LEAF.size
+        leaves.append((kind, addr, value))
+    (nops,) = struct.unpack_from("<H", buf, off)
+    off += 2
+    ops = list(struct.unpack_from(f"<{nops}B", buf, off)) if nops else []
+    off += nops
+    # mid-call value sequence (SDCU's genuine generator state stream; empty for
+    # SDDF). The Berlekamp-Massey input for the LFSR-vs-not verdict.
+    (nval,) = struct.unpack_from("<H", buf, off)
+    off += 2
+    valseq = list(struct.unpack_from(f"<{nval}B", buf, off)) if nval else []
+    off += nval
+    entry = {
+        "pc": pc,
+        "reg": reg,
+        "flags": flags,
+        "count": count,
+        "val_lo": vlo,
+        "val_hi": vhi,
+        "val_first": vfirst,
+        "has_stride": bool(flags & 1),
+        "any_out_of_window": bool(flags & 2),
+        "stride_base": sbase,
+        "stride_step": sstep,
+        "stride_idx_min": simin,
+        "stride_idx_max": simax,
+        "slice_pcs": pcs,
+        "leaves": leaves,
+        "op_seq": ops,
+        "val_seq": valseq,
+    }
+    return entry, off
 
 
 def parse_sdst(path):
@@ -229,68 +326,51 @@ def parse_sdst(path):
                 )
                 off += _IDXR_ENTRY.size
                 idx_reads.append((pc, base, stride, imin, imax, count))
-        elif tag in (b"SDDF", b"SDCU"):
+        elif tag == b"SDDF":
             (nent,) = struct.unpack_from("<I", buf, off)
             off += 4
-            dest = siddf if tag == b"SDDF" else sdcu
             for _ in range(nent):
-                (
-                    pc,
-                    reg,
-                    flags,
-                    count,
-                    vlo,
-                    vhi,
-                    vfirst,
-                    sbase,
-                    sstep,
-                    simin,
-                    simax,
-                ) = _SIDDF_HEAD.unpack_from(buf, off)
-                off += _SIDDF_HEAD.size
-                (npcs,) = struct.unpack_from("<H", buf, off)
-                off += 2
-                pcs = list(struct.unpack_from(f"<{npcs}H", buf, off))
-                off += 2 * npcs
-                (nleaves,) = struct.unpack_from("<H", buf, off)
-                off += 2
-                leaves = []
-                for _ in range(nleaves):
-                    kind, addr, value = _SIDDF_LEAF.unpack_from(buf, off)
-                    off += _SIDDF_LEAF.size
-                    leaves.append((kind, addr, value))
-                (nops,) = struct.unpack_from("<H", buf, off)
-                off += 2
-                ops = list(struct.unpack_from(f"<{nops}B", buf, off)) if nops else []
-                off += nops
-                # mid-call value sequence (SDCU's genuine generator state stream;
-                # empty for SDDF). The BM input for the LFSR-vs-not verdict.
-                (nval,) = struct.unpack_from("<H", buf, off)
-                off += 2
-                valseq = (list(struct.unpack_from(f"<{nval}B", buf, off))
-                          if nval else [])
-                off += nval
-                dest.append(
-                    {
-                        "pc": pc,
-                        "reg": reg,
-                        "flags": flags,
-                        "count": count,
-                        "val_lo": vlo,
-                        "val_hi": vhi,
-                        "val_first": vfirst,
-                        "has_stride": bool(flags & 1),
-                        "any_out_of_window": bool(flags & 2),
-                        "stride_base": sbase,
-                        "stride_step": sstep,
-                        "stride_idx_min": simin,
-                        "stride_idx_max": simax,
-                        "slice_pcs": pcs,
-                        "leaves": leaves,
-                        "op_seq": ops,
-                        "val_seq": valseq,
-                    }
-                )
+                entry, off = _parse_siddf_entry(buf, off)
+                siddf.append(entry)
+        elif tag == b"SDCU":
+            # version 2: per cell -> cell u16, nVariants u16; each variant is an
+            # SDDF-shaped value entry (pc slot = store_pc) followed by the guard
+            # chain. (A version-1 reader saw a single SDDF-shaped summary per cell.)
+            (nent,) = struct.unpack_from("<I", buf, off)
+            off += 4
+            for _ in range(nent):
+                cell, nvar = struct.unpack_from("<HH", buf, off)
+                off += 4
+                variants = []
+                for _ in range(nvar):
+                    entry, off = _parse_siddf_entry(buf, off)
+                    entry["store_pc"] = entry.pop("pc")
+                    (nguards,) = struct.unpack_from("<B", buf, off)
+                    off += 1
+                    guards = []
+                    for _ in range(nguards):
+                        cmp_op, sense, imm, gflags = _SDCU_GUARD.unpack_from(buf, off)
+                        off += _SDCU_GUARD.size
+                        (gnl,) = struct.unpack_from("<H", buf, off)
+                        off += 2
+                        gleaves = []
+                        for _ in range(gnl):
+                            kind, addr, value = _SIDDF_LEAF.unpack_from(buf, off)
+                            off += _SIDDF_LEAF.size
+                            gleaves.append((kind, addr, value))
+                        guards.append(
+                            {
+                                "cmp": cmp_op,
+                                "cmp_name": CMP_NAME.get(cmp_op, "?"),
+                                "sense": sense,
+                                "imm": imm,
+                                "unresolved": bool(gflags & 1),
+                                "leaves": gleaves,
+                            }
+                        )
+                    entry["guards"] = guards
+                    variants.append(entry)
+                sdcu.append({"cell": cell, "variants": variants})
         elif tag == b"STSQ":
             (nent,) = struct.unpack_from("<I", buf, off)
             off += 4
