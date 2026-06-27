@@ -254,10 +254,10 @@ index 691ab7f8..e82f4a3b 100644
          if (addr >= 0x0400 && addr <= 0x07ff)
 diff --git a/src/c64/membus_trace.h b/src/c64/membus_trace.h
 new file mode 100644
-index 00000000..dbc47788
+index 00000000..0e609725
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,2673 @@
+@@ -0,0 +1,2680 @@
 +/*
 + * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
 + * Not part of upstream libsidplayfp. Scratch use only.
@@ -787,7 +787,14 @@ index 00000000..dbc47788
 +    // MAX_VARIANTS store sites per cell, MAX_GUARDS enclosing guards per variant,
 +    // MAX_GUARD_LEAVES leaves per guard. Flat vs frame count.
 +    static constexpr uint32_t MAX_VARIANTS     = 4;
-+    static constexpr uint32_t MAX_GUARDS       = 3;
++    // 8 (was 3): a reload/slide variant's controlling branch chain can interleave
++    // static-config branches (read-only song-data predicates) BEFORE the per-frame
++    // note-pointer STATE-cell predicate that distinguishes hold vs slide. Capping
++    // at 3 truncated those state predicates (e.g. MA freq cells: 7_Years 0x108e/
++    // 0x108b, 3LUX 0x108c), making a gated portamento look ungated. 8 surfaces the
++    // distinguishing predicates while staying bounded (cost: a few more guards per
++    // variant; the value slice is recorded once so op_seq is unaffected).
++    static constexpr uint32_t MAX_GUARDS       = 8;
 +    static constexpr uint32_t MAX_GUARD_LEAVES = 16;
 +    std::map<uint16_t, CellUpdate> sdcu;
 +
