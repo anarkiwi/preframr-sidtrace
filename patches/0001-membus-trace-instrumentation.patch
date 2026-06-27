@@ -254,10 +254,10 @@ index 691ab7f8..e82f4a3b 100644
          if (addr >= 0x0400 && addr <= 0x07ff)
 diff --git a/src/c64/membus_trace.h b/src/c64/membus_trace.h
 new file mode 100644
-index 00000000..0e609725
+index 00000000..fa62c022
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,2680 @@
+@@ -0,0 +1,2731 @@
 +/*
 + * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
 + * Not part of upstream libsidplayfp. Scratch use only.
@@ -1810,6 +1810,33 @@ index 00000000..0e609725
 +        return true;   // any other recognised value-defining op reads memory
 +    }
 +
++    // Does the opcode read the accumulator A as a CARRIED input (result depends on
++    // the PRIOR A): a binary ALU op A = A op operand (ADC/SBC/AND/ORA/EOR) or an
++    // accumulator-mode shift A = shift(A) (ASL/LSR/ROL/ROR on A). For an additive
++    // accumulator `cell' = cell + step`, the `adc cell` records the cell self-leaf
++    // via its MEMORY operand, but the STEP is the prior A (an `lda step` feeding the
++    // adc); the slicer must chase prior A to capture it. Plain loads/transfers
++    // OVERWRITE A and carry no prior-A dependence, so they are excluded.
++    static inline bool aluReadsAcc(uint8_t op)
++    {
++        switch (op)
++        {
++        case 0x69: case 0x65: case 0x75: case 0x6D: case 0x7D: case 0x79:
++        case 0x61: case 0x71:                                   // ADC
++        case 0xE9: case 0xE5: case 0xF5: case 0xED: case 0xFD: case 0xF9:
++        case 0xE1: case 0xF1:                                   // SBC
++        case 0x29: case 0x25: case 0x35: case 0x2D: case 0x3D: case 0x39:
++        case 0x21: case 0x31:                                   // AND
++        case 0x09: case 0x05: case 0x15: case 0x0D: case 0x1D: case 0x19:
++        case 0x01: case 0x11:                                   // ORA
++        case 0x49: case 0x45: case 0x55: case 0x4D: case 0x5D: case 0x59:
++        case 0x41: case 0x51:                                   // EOR
++        case 0x0A: case 0x4A: case 0x2A: case 0x6A:             // ASL/LSR/ROL/ROR A
++            return true;
++        }
++        return false;
++    }
++
 +    // Which index register an opcode's effective address uses (indexed modes).
 +    static inline uint8_t indexRegFor(uint8_t op)
 +    {
@@ -2320,6 +2347,14 @@ index 00000000..0e609725
 +                         in.opcode == 0x6B || in.opcode == 0xCB))
 +                        addImmOrSmcLeaf(s, in);
 +                }
++                // An ALU op that carries the accumulator (A = A op operand, or an
++                // accumulator-mode shift of A) depends on the PRIOR A: chase it so an
++                // additive accumulator's STEP -- the `lda step` feeding an `adc cell`
++                // (the cell self-read is the adc memory operand) -- enters the slice
++                // as a leaf. Read-the-function: only the executed prior-A def is
++                // followed; nothing is fabricated.
++                if (dr == SR_A && aluReadsAcc(in.opcode))
++                    push(SliceTask{ idx, SR_A, 0, true });
 +                break;
 +            }
 +            if (!found) addLeaf(s, LK_OUT_OF_WINDOW, 0, 0);
@@ -2600,6 +2635,22 @@ index 00000000..0e609725
 +                        addPc(s, w.pc);
 +                        if (isStore(w.opcode))
 +                        {
++                            // If `a` is a persistent PLAY state cell (written AND
++                            // read back across play calls -- a carry / accumulator
++                            // the slice would otherwise pass straight THROUGH to its
++                            // reload/init source), the SID value proximately DEPENDS
++                            // on the cell's carried value. Record it as a state leaf
++                            // (finalizeLeaves upgrades RAM_READ -> STATE_CELL by the
++                            // access map) so the generator-DAG closure includes the
++                            // cell's OWN self-update (SDCU accumulator) and the host
++                            // can role-link this register to it. Still chase the
++                            // writer to keep the note-change reload / init provenance.
++                            const uint8_t ab = acc[a];
++                            if ((ab & ACC_WRITE_PLAY) &&
++                                ((ab & ACC_READ_PLAY) ||
++                                 (ab & (ACC_EXEC_INIT | ACC_EXEC_PLAY))))
++                                addLeaf(s, LK_RAM_READ, a,
++                                        ramFn ? ramFn(ramCtx, a) : 0);
 +                            push(SliceTask{ wslot, storeSrcReg(w.opcode), 0, true });
 +                            if (w.idxUsed != SR_NONE)
 +                                push(SliceTask{ wslot, w.idxUsed, 0, true });
