@@ -882,3 +882,62 @@ def test_settle_section_flat_vs_capture_length(tmp_path, fixture_sid):
     assert setl_sstr_nbytes(short) == setl_sstr_nbytes(long), (
         "SETL+SSTR size grew with capture length -- must be flat vs frames"
     )
+
+
+# --- VEVT (per-voice post-settle note timeline) -----------------------------
+
+
+@pytest.fixture(scope="session")
+def note_gate_sid(tmp_path_factory):
+    """A PSID that retriggers voice-0 notes every 16 frames (VEVT fixture)."""
+    d = tmp_path_factory.mktemp("ngsid")
+    sid = d / "note_gate.sid"
+    subprocess.run(
+        [sys.executable, str(HERE / "make_note_gate_sid.py"), str(sid)],
+        check=True,
+    )
+    assert sid.stat().st_size > 0
+    return sid
+
+
+@pytest.fixture(scope="session")
+def note_gate_trace(tmp_path_factory, note_gate_sid):
+    d = tmp_path_factory.mktemp("ngtrace")
+    prefix = d / "out"
+    subprocess.run(
+        [_sidtrace_bin(), str(note_gate_sid), "0", "400", str(prefix)],
+        check=True,
+    )
+    return parse_sdst(Path(f"{prefix}.distill.bin"))
+
+
+def test_vevt_present_and_well_formed(note_gate_trace):
+    """VEVT carries a per-voice post-settle note timeline; events are sane."""
+    ve = note_gate_trace["voice_events"]
+    assert ve, "note-gate fixture must produce voice events"
+    v0 = next(v for v in ve if v["voice"] == 0)
+    for ev in v0["events"]:
+        assert ev["gate"] in (0, 1)
+        assert ev["gate"] == (ev["ctrl"] & 1)
+        assert 0 <= ev["freq"] <= 0xFFFF
+        assert ev["frame"] >= 0
+
+
+def test_vevt_onsets_carry_distinct_table_freqs(note_gate_trace):
+    """Note ONSETS (gate=1) recur on a fixed period with the table's note freqs."""
+    v0 = next(v for v in note_gate_trace["voice_events"] if v["voice"] == 0)
+    onsets = [e for e in v0["events"] if e["gate"] == 1]
+    assert len(onsets) >= 4
+    # The fixture retriggers every 16 frames: onset frames are ~evenly spaced.
+    gaps = [b["frame"] - a["frame"] for a, b in zip(onsets, onsets[1:])]
+    assert all(g == 16 for g in gaps), gaps
+    # Freqs are 16-bit values assembled from the fixture's freq-lo/hi tables.
+    assert any(e["freq"] == 0x1140 for e in onsets)  # note 1: hi=0x11, lo=0x40
+
+
+def test_vevt_flat_across_subtune_with_no_gate_edges(trace):
+    """The default fixture holds gate constant -> no spurious VEVT events."""
+    d = parse_sdst(trace["distill"])
+    assert d["voice_events"] == [] or all(
+        not v["events"] for v in d["voice_events"]
+    )

@@ -254,10 +254,10 @@ index 691ab7f8..e82f4a3b 100644
          if (addr >= 0x0400 && addr <= 0x07ff)
 diff --git a/src/c64/membus_trace.h b/src/c64/membus_trace.h
 new file mode 100644
-index 00000000..18d5c315
+index 00000000..2958ce82
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,2188 @@
+@@ -0,0 +1,2244 @@
 +/*
 + * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
 + * Not part of upstream libsidplayfp. Scratch use only.
@@ -460,6 +460,22 @@ index 00000000..18d5c315
 +    bool     haveLast = false;
 +    bool     isLoad = false;                  // saw a load (0xB1) on this pair
 +    bool     isStore = false;                 // saw a store (0x91) on this pair
++};
++
++// --- VEVT (per-voice post-settle note timeline) ----------------------------
++// A player-agnostic per-voice NOTE schedule observed post-settle: each gate edge
++// (control reg $D404/$D40B/$D412 bit0 change) is a note ONSET (rising) or RELEASE
++// (falling); `freq` is the voice's current 16-bit frequency at the edge (the
++// note's pitch, mapped to an A440 grid index by the host). This is the structural
++// substrate the universal-format recovery turns into pattern rows -- the emulator
++// disambiguates note boundaries the raw register stream leaves implicit. Bounded
++// per voice by VE_CAP.
++struct VoiceEvent
++{
++    uint32_t frame;   // post-settle play-call index (frameNo - settleFrame)
++    uint16_t freq;    // 16-bit voice frequency at the edge
++    uint8_t  ctrl;    // control register value at the edge
++    uint8_t  gate;    // gate bit AFTER the edge (1 = note-on, 0 = note-off)
 +};
 +
 +// --- RELO (init block-copy capture; recovery-offload item #3) --------------
@@ -685,6 +701,15 @@ index 00000000..18d5c315
 +    std::map<uint16_t, IdxSummary> idxReads;
 +    // Timestamped SID-write stream (small; for the per-frame render gate).
 +    std::vector<SidWrEvent> sidStream;
++
++    // VEVT: per-voice post-settle note timeline (gate-edge events). voiceFreq /
++    // voiceGate shadow each voice's current frequency / gate; an event is pushed
++    // on each post-settle gate change (see recordSidWrite).
++    static constexpr uint32_t VE_CAP = 200000;  // per-voice event ceiling
++    uint16_t voiceFreq[3] = {0, 0, 0};
++    uint8_t  voiceGate[3] = {0, 0, 0};
++    bool     voiceGateInit[3] = {false, false, false};
++    std::vector<VoiceEvent> voiceEvents[3];
 +
 +    // SIDDF: per-(PC,reg) data-flow summary, same key space as sidWrites.
 +    std::map<uint32_t, SiddfSummary> siddf;
@@ -1164,6 +1189,13 @@ index 00000000..18d5c315
 +        sidWrites.clear();
 +        idxReads.clear();
 +        sidStream.clear();
++        for (int v = 0; v < 3; ++v)
++        {
++            voiceEvents[v].clear();
++            voiceFreq[v] = 0;
++            voiceGate[v] = 0;
++            voiceGateInit[v] = false;
++        }
 +        siddf.clear();
 +        sdcu.clear();
 +        stateSeq.clear();
@@ -1293,6 +1325,30 @@ index 00000000..18d5c315
 +            curFrameSidWrites++;
 +        }
 +        const uint8_t reg = (uint8_t)(addr & 0x1f);
++        // VEVT: shadow each voice's freq/gate and emit a post-settle note event on
++        // every gate edge. reg layout: voice v owns freq-lo v*7, freq-hi v*7+1,
++        // ctrl v*7+4 ($D400/1/4, $D407/8/B, $D40E/F/12).
++        if (reg < 21)
++        {
++            const int v = reg / 7;
++            const uint8_t field = reg % 7;
++            if (field == 0)
++                voiceFreq[v] = (uint16_t)((voiceFreq[v] & 0xff00) | val);
++            else if (field == 1)
++                voiceFreq[v] = (uint16_t)((voiceFreq[v] & 0x00ff) | ((uint16_t)val << 8));
++            else if (field == 4)
++            {
++                const uint8_t g = (uint8_t)(val & 1);
++                if (voiceGateInit[v] && g != voiceGate[v] && settleFound &&
++                    frameNo >= settleFrame && voiceEvents[v].size() < VE_CAP)
++                {
++                    voiceEvents[v].push_back(
++                        VoiceEvent{ frameNo - settleFrame, voiceFreq[v], val, g });
++                }
++                voiceGate[v] = g;
++                voiceGateInit[v] = true;
++            }
++        }
 +        SidWrSummary &s = sidWrites[((uint32_t)pc() << 5) | reg];
 +        s.count++;
 +        s.lastVal = val;

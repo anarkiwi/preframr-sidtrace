@@ -87,6 +87,11 @@ _SETL_REC = struct.Struct("<BBxxIIIII")
 _SSTR_IDX = struct.Struct("<HHiBBBxII")
 #  per pointer-walk entry: zp u16, pad u16, advCount u32
 _SSTR_PTR = struct.Struct("<HxxI")
+# VEVT (per-voice post-settle note timeline): per voice header then events.
+#  voice u8, pad u8, pad u16, nEvents u32; then nEvents * (frame u32, freq u16,
+#  ctrl u8, gate u8).
+_VEVT_HEAD = struct.Struct("<BBHI")
+_VEVT_REC = struct.Struct("<IHBB")
 
 # Leaf kinds (mirror membus_trace.h LeafKind).
 LK_IMMEDIATE = 0
@@ -179,6 +184,7 @@ def parse_sdst(path):
     settle = None
     steady_idx = []
     steady_ptr = []
+    voice_events = []
     while off < len(buf):
         tag = buf[off : off + 4]
         off += 4
@@ -463,6 +469,20 @@ def parse_sdst(path):
                 zp, adv = _SSTR_PTR.unpack_from(buf, off)
                 off += _SSTR_PTR.size
                 steady_ptr.append({"zp": zp, "adv_count": adv})
+        elif tag == b"VEVT":
+            (nvoice,) = struct.unpack_from("<I", buf, off)
+            off += 4
+            for _ in range(nvoice):
+                voice, _p8, _p16, nev = _VEVT_HEAD.unpack_from(buf, off)
+                off += _VEVT_HEAD.size
+                events = []
+                for _ in range(nev):
+                    frame, freq, ctrl, gate = _VEVT_REC.unpack_from(buf, off)
+                    off += _VEVT_REC.size
+                    events.append(
+                        {"frame": frame, "freq": freq, "ctrl": ctrl, "gate": gate}
+                    )
+                voice_events.append({"voice": voice, "events": events})
         else:
             raise ValueError(f"unknown SDST section {tag!r}")
 
@@ -493,6 +513,7 @@ def parse_sdst(path):
         "settle": settle,
         "steady_idx": steady_idx,
         "steady_ptr": steady_ptr,
+        "voice_events": voice_events,
     }
 
 
