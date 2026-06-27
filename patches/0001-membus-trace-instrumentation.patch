@@ -254,10 +254,10 @@ index 691ab7f8..e82f4a3b 100644
          if (addr >= 0x0400 && addr <= 0x07ff)
 diff --git a/src/c64/membus_trace.h b/src/c64/membus_trace.h
 new file mode 100644
-index 00000000..6e9d2266
+index 00000000..1b159b9f
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,3052 @@
+@@ -0,0 +1,3079 @@
 +/*
 + * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
 + * Not part of upstream libsidplayfp. Scratch use only.
@@ -1230,7 +1230,7 @@ index 00000000..6e9d2266
 +                            const uint8_t op = aluOp(cur.opcode);
 +                            if (op == ALU_INC || op == ALU_DEC || op == ALU_ASL ||
 +                                op == ALU_LSR || op == ALU_ROL || op == ALU_ROR)
-+                                recordCellRmw(ma, op, cur.pc);
++                                recordCellRmw(ma, op, cur.pc, retiredIdx);
 +                        }
 +                        // ACCUMULATED (item #7): track distinct writer PCs of this
 +                        // cell within the frame; >=2 -> the cell is an accumulator.
@@ -2274,7 +2274,8 @@ index 00000000..6e9d2266
 +        return &u.variants.back();
 +    }
 +
-+    inline void recordCellRmw(uint16_t cellAddr, uint8_t op, uint16_t pc)
++    inline void recordCellRmw(uint16_t cellAddr, uint8_t op, uint16_t pc,
++                              uint32_t storeSlot)
 +    {
 +        CellVariant *vp = variantFor(cellAddr, pc);
 +        if (!vp) return;
@@ -2300,6 +2301,18 @@ index 00000000..6e9d2266
 +            nd.args.push_back(pr);
 +            vp->irNodes.push_back(nd);
 +            vp->irStoreNode = 0;
++        }
++        // RMW-VARIANT GUARDS (design 4c.c): an in-place RMW variant is just as
++        // branch-conditioned as a STA variant (a counter that only ticks on the
++        // controlling path). Capture its guard chain once, like sliceCellUpdate,
++        // so the forward interp can select it -- empty guards make the first
++        // variant always fire and shadow the others.
++        if (!vp->guardsCaptured)
++        {
++            const uint32_t windowLen = ringFill < RING_CAP ? ringFill : RING_CAP;
++            captureGuards(*vp, storeSlot);
++            vp->guardsCaptured = true;
++            (void)windowLen;
 +        }
 +    }
 +
@@ -2547,6 +2560,20 @@ index 00000000..6e9d2266
 +        o.klass = irKlassFor(o.base, indexed);
 +        o.value = ramFn ? ramFn(ramCtx, ea) : in.memVal;
 +        if (indexed) o.indexCell = resolveIndexCell(slot, in.idxUsed, windowLen);
++        // INDEX-BAKE (design 4c.a): an indexed read whose index register has NO
++        // live source cell (loaded by INX/immediate/loop-counter, not a memory
++        // cursor) is NOT forward-evaluable as base+index_cell -- index_cell is 0,
++        // so the interp would read `base` and miss the per-voice offset. Bake the
++        // OBSERVED effective address into a non-indexed operand so the forward
++        // interp reads the byte the slice actually read (e.g. voice-2 X=1:
++        // Mem($175c,ABS_X,idx=0) -> Mem($175d,ABS)). When a live cursor cell IS
++        // found (index_cell != 0) the indexed form stays (the interp adds it).
++        if (indexed && o.indexCell == 0)
++        {
++            o.base = ea;
++            o.mode = (ea < 0x100) ? IM_ZP : IM_ABS;
++            o.klass = irKlassFor(ea, false);
++        }
 +        return o;
 +    }
 +
