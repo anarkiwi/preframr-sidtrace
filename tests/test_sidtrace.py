@@ -514,12 +514,24 @@ def test_smc_operand_emits_sdcu_and_stateseq(smc_trace):
     d = parse_sdst(smc_trace["distill"])
     assert d["sdcu"], "SMC operand produced no SDCU update DAG (Gap-2 regression)"
     assert d["stateseq"], "SMC operand produced no STATESEQ (Gap-2 regression)"
-    # SDCU/STATESEQ cells are exactly the SIDDF-flagged state cells.
-    state_addrs = {
-        a for e in d["siddf"] for k, a, _v in e["leaves"] if k == LK_STATE_CELL
-    }
-    assert {e["pc"] for e in d["sdcu"]} <= state_addrs
-    assert {e["addr"] for e in d["stateseq"]} <= state_addrs
+    # SDCU/STATESEQ now emit the TRANSITIVE CLOSURE of the generator DAG, not just
+    # the cells that feed a SID write directly: the SID-write state leaves SEED the
+    # set, which is then closed under each emitted cell's own update-slice leaves --
+    # so a generator feeding ANOTHER generator (not a SID register) is emitted too.
+    seed = {a for e in d["siddf"] for k, a, _v in e["leaves"] if k == LK_STATE_CELL}
+    sdcu_cells = {e["pc"] for e in d["sdcu"]}
+    stsq_cells = {e["addr"] for e in d["stateseq"]}
+    assert seed <= sdcu_cells, "SID-write state leaves missing from the SDCU DAG"
+    assert seed <= stsq_cells, "SID-write state leaves missing from STATESEQ"
+    # the emitted DAG is self-contained: every state-cell leaf of an emitted SDCU is
+    # itself emitted as a generator, or is at least observable via STATESEQ (a
+    # terminal cell with no captured update) -- nothing reachable is silently dropped.
+    for e in d["sdcu"]:
+        for k, a, _v in e["leaves"]:
+            if k == LK_STATE_CELL:
+                assert a in sdcu_cells or a in stsq_cells, (
+                    f"state-cell leaf ${a:04x} dropped from the generator closure"
+                )
     # the operand cell's STATESEQ tracks the generator (here a +1 counter walk).
     samples = d["stateseq"][0]["samples"]
     assert len(samples) >= 2 and len(set(samples)) >= 2, (

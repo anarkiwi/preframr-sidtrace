@@ -254,10 +254,10 @@ index 691ab7f8..e82f4a3b 100644
          if (addr >= 0x0400 && addr <= 0x07ff)
 diff --git a/src/c64/membus_trace.h b/src/c64/membus_trace.h
 new file mode 100644
-index 00000000..2958ce82
+index 00000000..f1e15528
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,2244 @@
+@@ -0,0 +1,2284 @@
 +/*
 + * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
 + * Not part of upstream libsidplayfp. Scratch use only.
@@ -329,6 +329,7 @@ index 00000000..2958ce82
 +#include <cstdio>
 +#include <cstring>
 +#include <map>
++#include <set>
 +#include <utility>
 +#include <vector>
 +
@@ -1889,19 +1890,27 @@ index 00000000..2958ce82
 +        // thousands of scratch RAM cells a busy player also writes+reads. The emit
 +        // filter (isSiddfStateCell, after finalizeLeaves) drops any that did not
 +        // end up classified as state. Cheap: tens of sites x tens of leaves.
++        auto sampleLeaf = [&](uint16_t a) {
++            if (a == 0 || a >= 0xd000) return;          // skip immediates / IO
++            const uint8_t b = acc[a];
++            const bool execAny   = b & (ACC_EXEC_INIT | ACC_EXEC_PLAY);
++            const bool writePlay = b & ACC_WRITE_PLAY;
++            const bool readPlay  = b & ACC_READ_PLAY;
++            const bool isState = (execAny && writePlay) ||
++                                 (writePlay && readPlay);
++            if (isState) sampleCell(a);
++        };
 +        for (const auto &kv : siddf)
 +            for (const auto &l : kv.second.leaves)
-+            {
-+                const uint16_t a = l.addr;
-+                if (a == 0 || a >= 0xd000) continue;        // skip immediates / IO
-+                const uint8_t b = acc[a];
-+                const bool execAny   = b & (ACC_EXEC_INIT | ACC_EXEC_PLAY);
-+                const bool writePlay = b & ACC_WRITE_PLAY;
-+                const bool readPlay  = b & ACC_READ_PLAY;
-+                const bool isState = (execAny && writePlay) ||
-+                                     (writePlay && readPlay);
-+                if (isState) sampleCell(a);
-+            }
++                sampleLeaf(l.addr);
++        // Also sample the leaves of state-cell UPDATE slices: a generator that
++        // feeds ANOTHER generator (not a SID write directly) needs its own
++        // inter-frame STSQ sequence too -- the deeper levels of the DAG that
++        // generatorCells() will emit. sdcu is populated as updates retire, so a
++        // deep cell's leaves are present by the time its update has been sliced.
++        for (const auto &kv : sdcu)
++            for (const auto &l : kv.second.leaves)
++                sampleLeaf(l.addr);
 +        frameNo++;
 +    }
 +
@@ -2363,6 +2372,37 @@ index 00000000..2958ce82
 +                if (l.kind == LK_STATE_CELL && l.addr == addr)
 +                    return true;
 +        return false;
++    }
++
++    // The TRANSITIVE CLOSURE of state cells whose update generator must be
++    // emitted: the GENERIC generator DAG, output-agnostic. Seed = the state-cell
++    // leaves of the SID-write (SIDDF) slices; then close under each included
++    // cell's OWN update slice (SDCU) leaves. A generator that feeds another
++    // generator -- not a SID register directly (a global LFO cell driving a
++    // per-voice freq cell, a counter feeding an index feeding a table read) --
++    // is thus emitted too, so the host sees the WHOLE function DAG and recovers
++    // structure (global vs voice, phase, recurrence family) generically rather
++    // than the emulator assuming any of it. Bounded by the (small) state-cell
++    // count; the fixed point terminates because the visited set only grows. Call
++    // AFTER finalizeLeaves().
++    std::set<uint16_t> generatorCells() const
++    {
++        std::set<uint16_t> out;
++        std::vector<uint16_t> work;
++        auto add = [&](uint16_t a) { if (out.insert(a).second) work.push_back(a); };
++        for (const auto &kv : siddf)
++            for (const auto &l : kv.second.leaves)
++                if (l.kind == LK_STATE_CELL) add(l.addr);
++        while (!work.empty())
++        {
++            const uint16_t c = work.back();
++            work.pop_back();
++            auto it = sdcu.find(c);
++            if (it == sdcu.end()) continue;
++            for (const auto &l : it->second.leaves)
++                if (l.kind == LK_STATE_CELL) add(l.addr);
++        }
++        return out;
 +    }
 +
 +    // Finalize the recovery-offload captures (items #1, #5, #7). Call AFTER
