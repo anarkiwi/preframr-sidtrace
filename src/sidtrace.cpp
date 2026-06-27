@@ -160,6 +160,32 @@ static std::vector<uint8_t> readFile(const char *path)
  *     the cell's MID-CALL value sequence (Berlekamp-Massey input).  O(code sites x
  *     variants x guard-depth), bounded SDCU_VALSEQ_M, flat vs frames.
  *
+ *   SECTION "SDIR" (FAITHFUL generator-IR; design generator-ir-design.md sec 4).
+ *     Where SDCU emits an unordered op-ENVELOPE + a leaf union, SDIR emits the
+ *     EXACT straight-line program each observed variant ran on one settled frame:
+ *     an ordered SSA body (one node per executed ALU/load, EXECUTION ORDER from
+ *     RetiredInstr.ringSeq) with fully-resolved operands -- Imm / Mem(base, mode,
+ *     index_cell, klass) / Prior(cell) (the recurrence self-edge) / Node(id) (an
+ *     earlier node's result) -- plus the evaluable guard chain (reused from
+ *     SDCU), the post-settle init seed, and the bytes of any Mem(TABLE) operand.
+ *     A body STOPS at persistent generator cells (emitted as Mem/Prior operands),
+ *     so each cell's multi-term structure lives in its own body, joined by
+ *     operand edges.  Python interprets it forward for byte-exact replay.  This
+ *     section is ADDITIVE: every section above is byte-identical to before.
+ *     Layout: nGenerators u32; per generator:
+ *       cell u16, destWidth u8, init u8, nVariants u8,
+ *       nTables u16; per table: base u16, stride u8, length u16, length*(byte u8);
+ *       per variant:
+ *         storePc u16, storeNode u16,
+ *         nGuards u8; per guard: cmpOp u8, sense u8, imm u8, gflags u8,
+ *                                nLeaves u16, nLeaves*(kind u8,_pad u8,addr u16,val u8,_pad u8);
+ *         nNodes u16; per node: op u8 (AluOp/IrExtraOp), carryIn u8, nArgs u8;
+ *           per arg: tag u8 (IrOpndTag), then by tag:
+ *             IO_IMM(0)  : imm i32;
+ *             IO_MEM(1)  : base u16, mode u8, indexCell u16, width u8, klass u8, value u8;
+ *             IO_PRIOR(2): cell u16, value u8;
+ *             IO_NODE(3) : node u16.
+ *
  *   SECTION "END\0" terminates.
  *
  * Returns the artifact size in bytes.
@@ -857,6 +883,126 @@ static long emit_distill(const char *path, MemBusTrace &tr,
                 wr_u8(f, e.gate);
             }
         }
+    }
+
+    // SDIR: the FAITHFUL generator-IR (design generator-ir-design.md section 4).
+    // Per generator cell, the ordered-SSA program of each observed variant: one
+    // node per executed ALU/load in execution order, with fully-resolved operands
+    // (Imm / Mem(base,mode,index_cell,klass) / Prior(cell) / Node(id)), the
+    // evaluable guard chain (reused from SDCU), the post-settle init seed, and the
+    // byte ranges of any Mem(TABLE) operand. ADDITIVE: every section above is
+    // byte-identical to the pre-change emitter. Layout (little-endian):
+    //   tag "SDIR"; nGenerators u32; per generator:
+    //     cell u16, destWidth u8, init u8, nVariants u8,
+    //     nTables u16, then per table: base u16, stride u8, length u16,
+    //                                  length * (byte u8);
+    //     per variant:
+    //       storePc u16, storeNode u16,
+    //       nGuards u8, then per guard: cmpOp u8, sense u8, imm u8, gflags u8,
+    //                                   nLeaves u16, nLeaves * leaf(kind u8,_pad u8,
+    //                                                               addr u16,val u8,_pad u8);
+    //       nNodes u16, then per node: op u8, carryIn u8, nArgs u8,
+    //         per arg: tag u8, then by tag:
+    //           IO_IMM(0)   : imm i32;
+    //           IO_MEM(1)   : base u16, mode u8, indexCell u16, width u8, klass u8, value u8;
+    //           IO_PRIOR(2) : cell u16, value u8;
+    //           IO_NODE(3)  : node u16.
+    {
+        fwrite("SDIR", 1, 4, f);
+        long nentPos = ftell(f);
+        wr_u32(f, 0);                          // nGenerators, backpatched
+        uint32_t nent = 0;
+        auto wr_leaf = [&](const libsidplayfp::SiddfLeaf &l) {
+            wr_u8(f, l.kind);
+            wr_u8(f, 0);
+            wr_u16(f, l.addr);
+            wr_u8(f, l.value);
+            wr_u8(f, 0);
+        };
+        const uint16_t TABLE_LEN = 64;         // bounded Mem(TABLE) byte window
+        for (const auto &kv : tr.sdcu)
+        {
+            const uint16_t cellAddr = kv.first;
+            if (!genCells.count(cellAddr)) continue;   // generator-DAG cells only
+            const libsidplayfp::CellUpdate &u = kv.second;
+            // Collect distinct Mem(TABLE) bases across this generator's variants.
+            std::set<uint16_t> tableBases;
+            for (const auto &var : u.variants)
+                for (const auto &nd : var.irNodes)
+                    for (const auto &a : nd.args)
+                        if (a.tag == libsidplayfp::IO_MEM &&
+                            a.klass == libsidplayfp::IK_TABLE)
+                            tableBases.insert(a.base);
+            wr_u16(f, cellAddr);
+            wr_u8(f, 1);                                // destWidth (cells are u8)
+            wr_u8(f, tr.ramSnapshot[cellAddr]);        // init seed (post-settle)
+            wr_u8(f, (uint8_t)u.variants.size());
+            wr_u16(f, (uint16_t)tableBases.size());
+            for (uint16_t base : tableBases)
+            {
+                uint32_t len = TABLE_LEN;
+                if ((uint32_t)base + len > 0x10000) len = 0x10000 - base;
+                wr_u16(f, base);
+                wr_u8(f, 1);                            // stride
+                wr_u16(f, (uint16_t)len);
+                for (uint32_t i = 0; i < len; ++i)
+                    wr_u8(f, tr.ramSnapshot[base + i]);
+            }
+            for (const auto &var : u.variants)
+            {
+                wr_u16(f, var.storePc);
+                wr_u16(f, var.irStoreNode);
+                wr_u8(f, (uint8_t)var.guards.size());
+                for (const auto &g : var.guards)
+                {
+                    uint8_t gflags = 0;
+                    if (g.unresolved) gflags |= 0x01;
+                    wr_u8(f, g.cmpOp);
+                    wr_u8(f, g.sense);
+                    wr_u8(f, g.immediate);
+                    wr_u8(f, gflags);
+                    wr_u16(f, (uint16_t)g.leaves.size());
+                    for (const auto &l : g.leaves) wr_leaf(l);
+                }
+                wr_u16(f, (uint16_t)var.irNodes.size());
+                for (const auto &nd : var.irNodes)
+                {
+                    wr_u8(f, nd.op);
+                    wr_u8(f, nd.carryIn);
+                    wr_u8(f, (uint8_t)nd.args.size());
+                    for (const auto &a : nd.args)
+                    {
+                        wr_u8(f, a.tag);
+                        switch (a.tag)
+                        {
+                        case libsidplayfp::IO_IMM:
+                            wr_i32(f, a.imm);
+                            break;
+                        case libsidplayfp::IO_MEM:
+                            wr_u16(f, a.base);
+                            wr_u8(f, a.mode);
+                            wr_u16(f, a.indexCell);
+                            wr_u8(f, a.width);
+                            wr_u8(f, a.klass);
+                            wr_u8(f, a.value);
+                            break;
+                        case libsidplayfp::IO_PRIOR:
+                            wr_u16(f, a.cell);
+                            wr_u8(f, a.value);
+                            break;
+                        case libsidplayfp::IO_NODE:
+                            wr_u16(f, a.node);
+                            break;
+                        }
+                    }
+                }
+            }
+            nent++;
+        }
+        long end = ftell(f);
+        fseek(f, nentPos, SEEK_SET);
+        wr_u32(f, nent);
+        fseek(f, end, SEEK_SET);
     }
 
     fwrite("END\0", 1, 4, f);
