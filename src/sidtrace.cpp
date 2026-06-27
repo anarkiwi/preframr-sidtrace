@@ -788,6 +788,33 @@ static long emit_distill(const char *path, MemBusTrace &tr,
         }
     }
 
+    // VEVT: per-voice post-settle note timeline. Each gate edge is a note onset
+    // (gate=1, freq=the note pitch) or release (gate=0). Layout: tag "VEVT";
+    // nvoices u32; then per voice with events: voice u8, _pad u8, _pad u16,
+    // nEvents u32, then nEvents * (frame u32, freq u16, ctrl u8, gate u8).
+    {
+        fwrite("VEVT", 1, 4, f);
+        uint32_t nv = 0;
+        for (int v = 0; v < 3; ++v)
+            if (!tr.voiceEvents[v].empty()) nv++;
+        wr_u32(f, nv);
+        for (int v = 0; v < 3; ++v)
+        {
+            if (tr.voiceEvents[v].empty()) continue;
+            wr_u8(f, (uint8_t)v);
+            wr_u8(f, 0);
+            wr_u16(f, 0);
+            wr_u32(f, (uint32_t)tr.voiceEvents[v].size());
+            for (const auto &e : tr.voiceEvents[v])
+            {
+                wr_u32(f, e.frame);
+                wr_u16(f, e.freq);
+                wr_u8(f, e.ctrl);
+                wr_u8(f, e.gate);
+            }
+        }
+    }
+
     fwrite("END\0", 1, 4, f);
     long sz = ftell(f);
     fclose(f);
