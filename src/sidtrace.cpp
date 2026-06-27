@@ -26,6 +26,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <set>
 
 #include "sidplayfp/sidplayfp.h"
 #include "sidplayfp/SidTune.h"
@@ -368,8 +369,16 @@ static long emit_distill(const char *path, MemBusTrace &tr,
         }
     }
 
+    // The generic generator DAG: every state cell whose update generator we
+    // emit, transitively closed from the SID-write slices through each cell's
+    // own update slice. Both STSQ and SDCU below are filtered to this set, so a
+    // generator feeding another generator (not a SID register directly) is
+    // emitted -- the host recovers global-vs-voice / phase / recurrence
+    // structure from the WHOLE DAG, the emulator assuming none of it.
+    const std::set<uint16_t> genCells = tr.generatorCells();
+
     // STSQ: bounded inter-frame state-cell sample sequences, filtered to the
-    // cells SIDDF flagged as state leaves (design 3.2). O(state cells * M), flat.
+    // generator-DAG cells (design 3.2). O(state cells * M), flat.
     {
         fwrite("STSQ", 1, 4, f);
         long nentPos = ftell(f);
@@ -378,7 +387,7 @@ static long emit_distill(const char *path, MemBusTrace &tr,
         for (const auto &kv : tr.stateSeq)
         {
             const uint16_t addr = kv.first;
-            if (!tr.isSiddfStateCell(addr)) continue;   // only real state cells
+            if (!genCells.count(addr)) continue;        // generator-DAG cells only
             const libsidplayfp::StateSeqCell &c = kv.second;
             uint8_t flags = 0;
             if (c.constDiff)  flags |= 0x01;   // holds_to_end
@@ -416,7 +425,7 @@ static long emit_distill(const char *path, MemBusTrace &tr,
         for (const auto &kv : tr.sdcu)
         {
             const uint16_t cellAddr = kv.first;
-            if (!tr.isSiddfStateCell(cellAddr)) continue;  // only real state cells
+            if (!genCells.count(cellAddr)) continue;       // generator-DAG cells only
             const libsidplayfp::SiddfSummary &s = kv.second;
             uint8_t flags = 0;
             if (s.hasStride)      flags |= 0x01;
