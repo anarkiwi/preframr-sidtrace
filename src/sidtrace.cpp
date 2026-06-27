@@ -726,6 +726,68 @@ static long emit_distill(const char *path, MemBusTrace &tr,
         fseek(f, end, SEEK_SET);
     }
 
+    // SETL: SETTLE-DETECTION + CLASSIFICATION (the player-agnostic "observe and
+    // derive" verdict). A single fixed record:
+    //   settle_found u8  -- 1 if steady state was detected within the cap
+    //   structure_present u8 -- 1 if the player indexes data-region tables (or walks
+    //                           an orderlist pointer) in STEADY state: route
+    //                           tracker-recovery; 0 -> algorithmic/computed-note or
+    //                           digi: route generator-fit / cover-fallback
+    //   _pad u8[2]
+    //   settle_frame u32 -- the play-call index at which steady state began (valid
+    //                       only when settle_found; the SNAP image is anchored here)
+    //   n_steady_idx u32 -- count of post-settle indexed table-walk PCs (SSTR rows)
+    //   n_steady_ptr u32 -- count of post-settle pointer-walk zp pairs
+    //   settle_hold u32, settle_cap u32 -- the detector thresholds (provenance)
+    {
+        fwrite("SETL", 1, 4, f);
+        wr_u8(f, tr.settleFound ? 1 : 0);
+        wr_u8(f, tr.steadyStructurePresent() ? 1 : 0);
+        wr_u8(f, 0);
+        wr_u8(f, 0);
+        wr_u32(f, tr.settleFrame);
+        wr_u32(f, (uint32_t)tr.idxSteady.size());
+        wr_u32(f, (uint32_t)tr.ptrSteadyAdv.size());
+        wr_u32(f, (uint32_t)libsidplayfp::MemBusTrace::SETTLE_HOLD);
+        wr_u32(f, (uint32_t)libsidplayfp::MemBusTrace::SETTLE_CAP);
+    }
+
+    // SSTR: STEADY-STATE STRUCTURE -- the read provenance restricted to frames
+    // AFTER settle (the tables the PLAYROUTINE indexes during steady playback,
+    // at runtime/post-relocation bases). One entry per post-settle indexed-read
+    // PC plus a trailing pointer-walk list. Layout: tag "SSTR";
+    //   n_idx u32; then n_idx * (pc u16, base u16, stride i32, idxMin u8, idxMax u8,
+    //                           flags u8 [bit0=targetsData, bit1=inImage], _pad u8,
+    //                           count u32, feedsRegMask u32),
+    //   n_ptr u32; then n_ptr * (zp u16, _pad u16, advCount u32).
+    {
+        fwrite("SSTR", 1, 4, f);
+        wr_u32(f, (uint32_t)tr.idxSteady.size());
+        for (const auto &kv : tr.idxSteady)
+        {
+            const libsidplayfp::MemBusTrace::SteadyIdx &s = kv.second;
+            uint8_t flags = 0;
+            if (s.targetsData) flags |= 0x01;
+            if (s.inImage)     flags |= 0x02;
+            wr_u16(f, kv.first);                      // pc
+            wr_u16(f, s.base);
+            wr_i32(f, s.strideGuess);
+            wr_u8(f, s.idxMin == 0xff ? 0 : s.idxMin);
+            wr_u8(f, s.idxMax);
+            wr_u8(f, flags);
+            wr_u8(f, 0);
+            wr_u32(f, (uint32_t)s.count);
+            wr_u32(f, s.feedsRegMask);
+        }
+        wr_u32(f, (uint32_t)tr.ptrSteadyAdv.size());
+        for (const auto &kv : tr.ptrSteadyAdv)
+        {
+            wr_u16(f, kv.first);                      // zp pair
+            wr_u16(f, 0);
+            wr_u32(f, kv.second);
+        }
+    }
+
     fwrite("END\0", 1, 4, f);
     long sz = ftell(f);
     fclose(f);
@@ -928,6 +990,9 @@ int main(int argc, char **argv)
     fprintf(fm, "total_cycles=%ld\n", done);
     fprintf(fm, "n_sid_writes=%llu\n", (unsigned long long)nSid);
     fprintf(fm, "distill_bytes=%ld\n", distillBytes);
+    fprintf(fm, "settle_found=%d\n", tr.settleFound ? 1 : 0);
+    fprintf(fm, "settle_frame=%u\n", tr.settleFound ? tr.settleFrame : 0u);
+    fprintf(fm, "structure_present=%d\n", tr.steadyStructurePresent() ? 1 : 0);
     fprintf(fm, "kernal=%s\n", kernal.empty() ? "none" : argv[5]);
     fclose(fm);
 

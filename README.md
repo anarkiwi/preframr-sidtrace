@@ -53,6 +53,8 @@ sections terminated by `"END\0"`:
 | `IDXR`  | indexed-read VSA summary: `(pc u16, base u16, stride i32, idxMin u8, idxMax u8, _pad u16, count u32)` — table base / element size / length / traversal |
 | `SDDF`  | per-SID-write **DATA-FLOW** summary, keyed by `(PC,reg)` (same key space as `SIDW`, so O(code sites) not O(frames)): a bounded in-emulator backward dynamic slice of each `STA $D4xx`'s value — the slice PCs, classified leaves (`immediate` / `ram_read` / `state_cell`[=SMC] / `exogenous` / `out_of_window`), the value-chain ALU op sequence, a strided-interval VSA for any indexed read feeding the write, and `val_lo/val_hi/val_first`. Turns "PC wrote r" into "how r was computed". Stays a flat ~1 KB as the capture window grows. |
 | `STSQ`  | inter-frame **STATE-CELL sample sequence**, keyed by RAM address, for every cell `SDDF` flagged as a state leaf: `(addr u16, flags u8 [bit0=holdsToEnd, bit1=wide], _pad u8, totalFrames u32, firstSeenFrame u32, nSamples u16, then nSamples × sample u8)`. The bounded (≤`M=512`/cell) per-play-call value sequence Stage C fits the recurrence over (Daikon-style relation / Berlekamp–Massey). `holdsToEnd`: the constant-stride recurrence implied by the prefix kept holding to the end of the capture (a cheap in-emulator running check). O(state cells × M), flat once the window exceeds M and all state cells are discovered. |
+| `SETL`  | **SETTLE DETECTION + CLASSIFICATION** (the player-agnostic "observe and derive" verdict). A single fixed record: `settle_found u8`, `structure_present u8`, `_pad[2]`, `settle_frame u32` (the play-call after which steady state began; the `SNAP` image is anchored here), `n_steady_idx u32`, `n_steady_ptr u32` (the `SSTR` row counts), `settle_hold u32`, `settle_cap u32` (the detector thresholds, for provenance). `structure_present`=1 ⇒ the player indexes data-region tables in the loaded image during steady playback (a data-driven tracker → route tracker-recovery); =0 ⇒ algorithmic / computed-note (e.g. *A Mind Is Born*) or digi → route generator-fit / cover-fallback. `settle_found`=0 (never settled within the cap) is itself a classification signal. See the settle-detection heuristic below. |
+| `SSTR`  | **STEADY-STATE STRUCTURE**: read provenance restricted to frames AFTER settle — the tables the PLAYROUTINE indexes during steady playback, at their RUNTIME / post-relocation bases (NOT static-image operands). `n_idx u32`; then per indexed-read PC `(pc u16, base u16, stride i32, idxMin u8, idxMax u8, flags u8 [bit0=targetsData, bit1=inImage], _pad u8, count u32, feedsRegMask u32)`; then `n_ptr u32`; then per `(zp),Y` pointer pair `(zp u16, _pad u16, advCount u32)` — the post-settle orderlist→pattern advance count. The base is fitted from the OPCODE'S actual index register (not the legacy `max(x,y)` the `IDXR` fields keep), so it is the true runtime table base. |
 
 The full byte layout is documented in `src/sidtrace.cpp` (`emit_distill`). `SDDF`
 is built by a bounded backward slicer over a ring buffer of retired play-call
@@ -62,11 +64,80 @@ frame for persistent state; ALU ← operands; indexed ← the index def) and lin
 persistent state cell to the table read that fills it across frames via a bounded
 per-address filler cache — all in-emulator, nothing streamed.
 
+### Settle detection (the `SETL` / `SSTR` "observe and derive" pass)
+
+A tune's first frames are INITIALISATION (depack / relocate / runtime table
+resolve), which runs one-shot code and writes large amounts of code and data.
+Steady-state playback is reached once that work SATURATES. Rather than fragile
+per-tune static-address discovery, `sidtrace` OBSERVES the run and DERIVES the
+settle point, then derives the playroutine's table-access structure from steady
+state and classifies whether authored data-structure is present at all.
+
+**The heuristic.** At each play-call (frame) boundary the recorder folds three
+bounded per-frame signals and declares the SETTLE FRAME as the first frame that
+OPENS a window of `SETTLE_HOLD = 8` consecutive frames in which ALL hold:
+
+- **(a) no write lands on a NEW executed-code byte** — the bulk code rewriting of
+  init / depack / relocation has ended. Tracked by NOVELTY (a code byte written
+  for the first time this run), not raw count: a steady self-modifying player
+  (DefMon `STA opnd` each call) re-pokes the SAME operands every frame (no
+  novelty), whereas a depacker writes fresh code addresses each frame. Counting
+  novelty is robust to the per-frame value variation a literal-count test chokes
+  on.
+- **(b) no NEW PC is executed** — the player's code footprint has stopped growing,
+  i.e. it has entered its fixed per-frame loop. Tracked by novelty over a
+  play-phase exec-PC bitmap, so a note-trigger path that adds its PCs the first
+  time it runs (then never again) does not block settle, while one-shot init /
+  relocation code keeps adding PCs.
+- **(c) the $D4xx SID-write cadence is PERIODIC** — a non-zero SID-write burst
+  every frame (the player is producing output). We require PRESENCE, not a
+  constant byte count (the count varies with note / gate events).
+
+Thresholds: `SETTLE_HOLD = 8` frames, give up after `SETTLE_CAP = 6000`
+play-calls. State is two flat 8 KiB bitmaps + a tiny `SETTLE_HOLD`-entry ring, so
+the detector is flat vs run length. The chosen thresholds are emitted in `SETL`
+for provenance.
+
+**Anchoring + structure.** When settle is first declared the recorder
+re-snapshots the live RAM in-emulator — so `SNAP` is anchored at the canonical
+unpacked / relocated / runtime-resolved image (NOT the static load image). The
+`SSTR` indexed-read / pointer-walk provenance accumulates ONLY after settle, so
+its table bases are the RUNTIME (post-relocation) addresses the playroutine reads.
+
+**Classification.** `structure_present` = the player performs an indexed
+table-walk that (i) sweeps ≥ `STRUCTURE_MIN_SPAN = 4` entries, (ii) over a region
+read as DATA in play, AND (iii) whose base lies in the LOADED IMAGE. Clause (iii)
+is the decisive tracker-vs-computed test: authored orderlist / pattern /
+instrument tables live in the image, whereas an algorithmic tune (*A Mind Is
+Born*) relocates its tiny generator state into ZERO PAGE and computes notes — its
+steady indexed reads are over zp/scratch, never the image, so it correctly
+classifies as NO authored structure (→ generator-fit / cover-fallback). A
+`(zp),Y` pointer walk ALONE is not sufficient (a generator can churn a zp pointer
+pair every iteration — *A Mind* advances one ~274×/frame — which is generator
+state, not an authored orderlist).
+
+**Honest caveats.** Settle is the moment the CODE footprint saturates and output
+is periodic; a player whose init shuffles only DATA on a fixed code loop with a
+periodic SID burst is, by these criteria, already steady (it settles early). The
+post-settle `SSTR` keeps accumulating, so a later branch-switch is still captured.
+A tune that never reaches a fixed loop within the cap (continuous per-frame
+depacking, some digi streamers) reports `settle_found = 0` — itself the routing
+signal. `STRUCTURE_MIN_SPAN`/the in-image gate are conservative; a tracker with a
+single tiny in-image table is the boundary case.
+
+**Backward compatibility.** `SETL` and `SSTR` are appended additively before the
+`END\0` terminator; every prior section (`ACMP`/`SNAP`/`SIDW`/`IDXR`/`SDDF`/
+`STSQ`/`SDCU`/`IDXS`/`PWLK`/`RELO`/`SDAC`/`DIGI`/`TMPO`/`IWLK`) is byte-unchanged,
+and the `.sidwr.bin` render stream is untouched, so existing `.distill.bin`
+consumers keep parsing. The only contents change is that `SNAP` is now anchored at
+the settle frame (a strictly better resident image); its byte LAYOUT is unchanged.
+
 ### `<prefix>.meta.txt`
 
 Plain-text tune metadata: format, subtune, song count, init/play/load addresses,
 speed, `artifact=SDST`, `cycles_per_frame`, `total_cycles`, `n_sid_writes`,
-`distill_bytes`, and whether a real KERNAL was supplied.
+`distill_bytes`, `settle_found`, `settle_frame`, `structure_present` (the human-
+readable mirror of the `SETL` verdict), and whether a real KERNAL was supplied.
 
 Readers (numpy dtype for `.sidwr.bin`, `parse_sdst` for the artifact) live in
 [`tests/sidtrace_records.py`](tests/sidtrace_records.py).

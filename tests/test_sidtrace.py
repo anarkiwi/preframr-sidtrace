@@ -742,3 +742,143 @@ def test_iwlk_is_additive_sidwr_unaffected(tmp_path, freq_table_sid):
     total = sum(c for _pc, _reg, c, _v in d["sid_writes"])
     assert total == sw.size, "SID-write summary diverged from sidwr (IWLK not additive)"
     assert d["iwlk_walks"], "expected IWLK on the freq-table fixture"
+
+
+# ===================================================================
+# SETTLE DETECTION + STEADY-STATE STRUCTURE (the "observe and derive" pass).
+# ===================================================================
+
+
+@pytest.fixture(scope="session")
+def relocating_sid(tmp_path_factory):
+    """A PSID that DEPACKS/RELOCATES its note table to a RUNTIME base (different from
+    the static-image source) before settling into steady note-table playback -- the
+    fixture for settle detection + steady-state structure derivation. The static
+    source table lives at $1100; the player relocates it to the RUNTIME base $1140
+    and, once settled, reads notes only from the runtime base. The steady-state
+    structure base MUST therefore be $1140, NEVER the static-image source $1100."""
+    d = tmp_path_factory.mktemp("relocating_sid")
+    sid = d / "reloc.sid"
+    subprocess.run(
+        [sys.executable, str(HERE / "make_relocating_sid.py"), str(sid)],
+        check=True,
+    )
+    assert sid.stat().st_size > 0
+    return sid
+
+
+def test_setl_section_present_and_parses(trace):
+    """The SETL settle-detection record is always present and parses, carrying the
+    settle verdict, the settle frame, the structure-present classification, and the
+    detector thresholds (provenance). Additive: older readers skip it."""
+    d = parse_sdst(trace["distill"])
+    s = d["settle"]
+    assert s is not None, "SETL section missing"
+    for k in (
+        "settle_found",
+        "structure_present",
+        "settle_frame",
+        "n_steady_idx",
+        "n_steady_ptr",
+        "settle_hold",
+        "settle_cap",
+    ):
+        assert k in s, f"SETL missing field {k}"
+    assert s["settle_hold"] > 0 and s["settle_cap"] > 0
+
+
+def test_setl_matches_meta(trace):
+    """The SETL section and the meta.txt settle/structure fields agree (one is the
+    binary artifact, the other the human-readable mirror)."""
+    d = parse_sdst(trace["distill"])
+    meta = parse_meta(trace["meta"])
+    s = d["settle"]
+    assert int(meta["settle_found"]) == int(s["settle_found"])
+    assert int(meta["structure_present"]) == int(s["structure_present"])
+    if s["settle_found"]:
+        assert int(meta["settle_frame"]) == s["settle_frame"]
+
+
+def test_vanilla_tracker_settles_and_has_structure(trace):
+    """The base fixture is a vanilla load-$1000 tracker that reaches steady state
+    quickly: settle is detected, and its SSTR steady-structure rows are consistent
+    with the SETL counts (n_steady_idx == len(steady_idx))."""
+    d = parse_sdst(trace["distill"])
+    s = d["settle"]
+    assert s["settle_found"], "vanilla tracker should reach steady state"
+    assert s["n_steady_idx"] == len(d["steady_idx"])
+    assert s["n_steady_ptr"] == len(d["steady_ptr"])
+
+
+def test_sstr_steady_structure_after_settle(relocating_sid, tmp_path):
+    """The decisive relocated-tracker validation: after a multi-frame relocation the
+    steady-state STRUCTURE base is the RUNTIME (post-relocation) address $1140, NOT
+    the static-image source $1100. The derivation observes the playroutine's table
+    walks AFTER settle, so it sees the runtime base the static operands never name."""
+    prefix = tmp_path / "reloc"
+    subprocess.run(
+        [_sidtrace_bin(), str(relocating_sid), "1", "300", str(prefix)],
+        check=True,
+    )
+    d = parse_sdst(Path(f"{prefix}.distill.bin"))
+    s = d["settle"]
+    assert s["settle_found"], "relocating tune should reach steady state"
+    assert s["structure_present"], "a note-table tracker must classify as structured"
+    # the steady note-table walk in the player code reads the RUNTIME base $1140.
+    player_tables = [
+        r
+        for r in d["steady_idx"]
+        if r["in_image"]
+        and r["targets_data"]
+        and (r["idx_max"] - r["idx_min"] + 1) >= 4
+        and 0x1000 <= r["pc"] < 0x1100
+    ]
+    bases = {r["base"] for r in player_tables}
+    assert 0x1140 in bases, (
+        f"steady structure base must be the RUNTIME table $1140, got {sorted(hex(b) for b in bases)}"
+    )
+    assert 0x1100 not in bases, (
+        "steady structure must NOT name the static-image source $1100 -- the "
+        "derivation must observe the post-relocation runtime base"
+    )
+
+
+def test_settle_is_additive_sidwr_unaffected(tmp_path, fixture_sid):
+    """SETL/SSTR are distill-only additive sections: emitting them does NOT change
+    the .sidwr.bin render stream (the byte-exact gate). The SID-write summary count
+    still equals the sidwr stream size."""
+    prefix = tmp_path / "settle_add"
+    subprocess.run(
+        [_sidtrace_bin(), str(fixture_sid), "1", str(NFRAMES), str(prefix)],
+        check=True,
+    )
+    d = parse_sdst(Path(f"{prefix}.distill.bin"))
+    sw = load_sidwr(Path(f"{prefix}.sidwr.bin"))
+    total = sum(c for _pc, _reg, c, _v in d["sid_writes"])
+    assert total == sw.size, "SID-write summary diverged from sidwr (settle not additive)"
+
+
+def test_settle_section_flat_vs_capture_length(tmp_path, fixture_sid):
+    """SETL is a single fixed record and SSTR is O(code sites): neither grows with
+    the number of frames captured. Trace a short and a long window and require the
+    SETL+SSTR span to be identical (the settle detector is flat vs run length)."""
+
+    def setl_sstr_nbytes(distill_path):
+        buf = distill_path.read_bytes()
+        i = buf.find(b"SETL")
+        assert i >= 0
+        j = buf.find(b"END\x00", i)
+        return (j if j >= 0 else len(buf)) - i
+
+    def trace_n(prefix, n):
+        subprocess.run(
+            [_sidtrace_bin(), str(fixture_sid), "1", str(n), str(prefix)],
+            check=True,
+        )
+        return Path(f"{prefix}.distill.bin")
+
+    short = trace_n(tmp_path / "sshort", 60)
+    long = trace_n(tmp_path / "slong", 600)
+    assert setl_sstr_nbytes(short) == setl_sstr_nbytes(long), (
+        "SETL+SSTR size grew with capture length -- must be flat vs frames"
+    )
