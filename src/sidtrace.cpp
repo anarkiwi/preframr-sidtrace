@@ -57,7 +57,7 @@ static std::vector<uint8_t> readFile(const char *path)
  * bus trace). One file per tune. Little-endian. Layout:
  *
  *   magic     char[4]   "SDST"
- *   version   u16       = 1
+ *   version   u16       = 2  (2: SDCU split into guarded branch variants)
  *   reserved  u16       = 0
  *   init      u16       PSID init address
  *   play      u16       PSID play address
@@ -138,20 +138,27 @@ static std::vector<uint8_t> readFile(const char *path)
  *     window without re-deriving over the whole run.  wide: a sample exceeded
  *     0xff (a 16-bit cell pair); samples are u8 in practice.
  *
- *   SECTION "SDCU" (per-state-cell UPDATE data-flow summary; design 2.2/2.3).
- *     Same variable-length entry layout as SDDF, but keyed by the state-cell
- *     ADDRESS (in the `pc` field; `reg` unused). For a fast mid-call SMC
- *     accumulator the SID-write slice bottoms out at the shadow cell as a LEAF
- *     (the blit just copies it to the register); SDCU is the backward slice of the
- *     STORE (or in-place INC/DEC/shift RMW) that DEFINED the cell earlier in the
- *     SAME play-call -- the update DAG cell' = f(cell, C, K, immediates) the host
- *     generalizes into U. Only cells SIDDF flagged as state leaves are emitted.
- *     O(state cells), flat vs frame count.  Tag char[4] "SDCU".  The trailing
- *     nValSeq field carries the cell's MID-CALL value sequence (the value the
- *     update wrote, sampled at the update site, NOT at the call boundary): the
- *     genuine generator state stream the host feeds to Berlekamp-Massey for the
- *     LFSR-vs-not verdict (a fast SMC cell's call-boundary STATESEQ is a constant
- *     residue and useless for this).  Bounded SDCU_VALSEQ_M, flat vs frames.
+ *   SECTION "SDCU" (per-state-cell UPDATE data-flow summary; design 2.2/2.3 +
+ *     branch structure, design 3).  Keyed by the state-cell ADDRESS: the backward
+ *     slice of the STORE (or in-place INC/DEC/shift RMW) that DEFINED the cell in
+ *     the SAME play-call -- the update DAG cell' = f(cell, C, K, immediates).
+ *     SDST v2 SPLITS the update by STORE SITE into guarded single-branch VARIANTS
+ *     (so a triangle PW/vibrato sweep is recovered as two variants, not a folded
+ *     {ADC,SBC} union).  Layout: nentries u32 (cells); per cell:
+ *       cell u16, nVariants u16; per variant:
+ *         <SDDF-shaped value entry, pc slot = storePc, reg = 0; value slice
+ *          recorded ONCE so op_seq is the true single-frame chain>,
+ *         nGuards u8; per guard:
+ *           cmpOp u8, sense u8, immediate u8, flags u8 (bit0 = unresolved),
+ *           nLeaves u16, then nLeaves * (kind u8,_pad u8, addr u16, value u8,_pad u8).
+ *     cmpOp (CmpOp) is the predicate that holds when the store fires; sense is the
+ *     branch's taken(1)/fall-through(0) side from the executed-PC trajectory; the
+ *     guard leaves are the tested operand's backward slice.  A cell with one
+ *     variant and zero guards is exactly the old straight-line SDCU.  Emitted for
+ *     the generator-DAG closure (SID-write state leaves seeded, closed over each
+ *     variant's value AND guard leaves).  The per-variant trailing nValSeq carries
+ *     the cell's MID-CALL value sequence (Berlekamp-Massey input).  O(code sites x
+ *     variants x guard-depth), bounded SDCU_VALSEQ_M, flat vs frames.
  *
  *   SECTION "END\0" terminates.
  *
@@ -171,7 +178,7 @@ static long emit_distill(const char *path, MemBusTrace &tr,
     if (!f) return -1;
 
     fwrite("SDST", 1, 4, f);
-    wr_u16(f, 1);                              // version
+    wr_u16(f, 2);                              // version (2: SDCU branch-structure variants)
     wr_u16(f, 0);                              // reserved
     wr_u16(f, ti ? (uint16_t)ti->initAddr() : 0);
     wr_u16(f, ti ? (uint16_t)ti->playAddr() : 0);
@@ -408,59 +415,80 @@ static long emit_distill(const char *path, MemBusTrace &tr,
         fseek(f, end, SEEK_SET);
     }
 
-    // SDCU: per-state-cell UPDATE data-flow summary (design 2.2/2.3). Same
-    // variable-length entry layout as SDDF, but keyed by the state-cell ADDRESS
-    // (written into the `pc` field; `reg` is unused/0). For a fast mid-call SMC
-    // accumulator the SID-write slice bottoms out at the cell as a leaf (the blit
-    // just copies the shadow cell to the register); SDCU is the backward slice of
-    // the STORE that DEFINED the cell earlier in the SAME play-call -- the update
-    // DAG cell' = f(cell, C, K, immediates) the host generalizes into U. Only the
-    // cells SIDDF flagged as state leaves are emitted (the handful that drive an
-    // axis), keeping it O(state cells), flat vs frame count. Tag "SDCU".
+    // SDCU: per-state-cell UPDATE data-flow summary (design 2.2/2.3 + branch
+    // structure, design 3). Keyed by the state-cell ADDRESS, but split by STORE
+    // SITE into guarded single-branch VARIANTS: each distinct store PC that
+    // defines the cell is one straight-line recurrence (value slice recorded
+    // once, so op_seq is the true single-frame chain) plus the GUARD chain that
+    // control-depends it. A cell with one variant and no guards is exactly the
+    // old straight-line SDCU (back-compatible). Only the generator-DAG cells are
+    // emitted (closed over the SID-write state leaves AND the guard predicates),
+    // O(code sites), flat vs frame count. Tag "SDCU" (version 2 layout):
+    //   nentries u32 (cells); per cell: cell u16, nVariants u16; per variant:
+    //   <SDDF-shaped value entry with the pc slot = storePc, reg = 0>, then
+    //   nGuards u8; per guard: cmpOp u8, sense u8, immediate u8, flags u8
+    //   (bit0 = unresolved), nLeaves u16, then nLeaves leaf records.
     {
         fwrite("SDCU", 1, 4, f);
         long nentPos = ftell(f);
         wr_u32(f, 0);                          // nentries, backpatched
         uint32_t nent = 0;
+        auto wr_leaf = [&](const libsidplayfp::SiddfLeaf &l) {
+            wr_u8(f, l.kind);
+            wr_u8(f, 0);
+            wr_u16(f, l.addr);
+            wr_u8(f, l.value);
+            wr_u8(f, 0);
+        };
         for (const auto &kv : tr.sdcu)
         {
             const uint16_t cellAddr = kv.first;
             if (!genCells.count(cellAddr)) continue;       // generator-DAG cells only
-            const libsidplayfp::SiddfSummary &s = kv.second;
-            uint8_t flags = 0;
-            if (s.hasStride)      flags |= 0x01;
-            if (s.anyOutOfWindow) flags |= 0x02;
-            wr_u16(f, cellAddr);               // key: the state-cell address
-            wr_u8(f, 0);                       // reg (unused for SDCU)
-            wr_u8(f, flags);
-            wr_u32(f, (uint32_t)s.count);
-            wr_u8(f, s.valSeen ? s.valLo : 0);
-            wr_u8(f, s.valHi);
-            wr_u8(f, s.valFirst);
-            wr_u8(f, 0);
-            wr_u16(f, s.strideBase);
-            wr_i32(f, s.strideStep);
-            wr_u8(f, s.strideIdxMin == 0xff ? 0 : s.strideIdxMin);
-            wr_u8(f, s.strideIdxMax);
-            wr_u16(f, (uint16_t)s.slicePcs.size());
-            for (uint16_t p : s.slicePcs) wr_u16(f, p);
-            wr_u16(f, (uint16_t)s.leaves.size());
-            for (const auto &l : s.leaves)
+            const libsidplayfp::CellUpdate &u = kv.second;
+            wr_u16(f, cellAddr);
+            wr_u16(f, (uint16_t)u.variants.size());
+            for (const auto &var : u.variants)
             {
-                wr_u8(f, l.kind);
+                const libsidplayfp::SiddfSummary &s = var.value;
+                uint8_t flags = 0;
+                if (s.hasStride)      flags |= 0x01;
+                if (s.anyOutOfWindow) flags |= 0x02;
+                wr_u16(f, var.storePc);        // variant id: the store PC (pc slot)
+                wr_u8(f, 0);                   // reg (unused for SDCU)
+                wr_u8(f, flags);
+                wr_u32(f, (uint32_t)s.count);
+                wr_u8(f, s.valSeen ? s.valLo : 0);
+                wr_u8(f, s.valHi);
+                wr_u8(f, s.valFirst);
                 wr_u8(f, 0);
-                wr_u16(f, l.addr);
-                wr_u8(f, l.value);
-                wr_u8(f, 0);
+                wr_u16(f, s.strideBase);
+                wr_i32(f, s.strideStep);
+                wr_u8(f, s.strideIdxMin == 0xff ? 0 : s.strideIdxMin);
+                wr_u8(f, s.strideIdxMax);
+                wr_u16(f, (uint16_t)s.slicePcs.size());
+                for (uint16_t p : s.slicePcs) wr_u16(f, p);
+                wr_u16(f, (uint16_t)s.leaves.size());
+                for (const auto &l : s.leaves) wr_leaf(l);
+                wr_u16(f, (uint16_t)s.opSeq.size());
+                for (uint8_t op : s.opSeq) wr_u8(f, op);
+                // mid-call value sequence (Berlekamp-Massey input), bounded.
+                wr_u16(f, (uint16_t)s.valSeq.size());
+                for (uint8_t v : s.valSeq) wr_u8(f, v);
+                // the guard chain (innermost first); the predicate the recoverer
+                // evaluates to know which variant fired each frame.
+                wr_u8(f, (uint8_t)var.guards.size());
+                for (const auto &g : var.guards)
+                {
+                    uint8_t gflags = 0;
+                    if (g.unresolved) gflags |= 0x01;
+                    wr_u8(f, g.cmpOp);
+                    wr_u8(f, g.sense);
+                    wr_u8(f, g.immediate);
+                    wr_u8(f, gflags);
+                    wr_u16(f, (uint16_t)g.leaves.size());
+                    for (const auto &l : g.leaves) wr_leaf(l);
+                }
             }
-            wr_u16(f, (uint16_t)s.opSeq.size());
-            for (uint8_t op : s.opSeq) wr_u8(f, op);
-            // mid-call value sequence: the genuine generator state stream sampled
-            // at the cell's UPDATE site (NOT at the call boundary). This is what the
-            // host feeds to Berlekamp-Massey for the LFSR-vs-not verdict (design
-            // 2.5/2.7). Bounded SDCU_VALSEQ_M, flat vs frame count.
-            wr_u16(f, (uint16_t)s.valSeq.size());
-            for (uint8_t v : s.valSeq) wr_u8(f, v);
             nent++;
         }
         long end = ftell(f);
@@ -649,23 +677,30 @@ static long emit_distill(const char *path, MemBusTrace &tr,
         uint16_t ncand = 0;
         for (const auto &kv : tr.sdcu)
         {
-            const libsidplayfp::SiddfSummary &s = kv.second;
             if (!tr.isSiddfStateCell(kv.first)) continue;
             // a frame-divider cell decrements (DEC in op_seq) and reloads from an
-            // immediate (an LK_IMMEDIATE leaf) -- the reload constant.
-            bool hasDec = false;
-            for (uint8_t op : s.opSeq)
-                if (op == libsidplayfp::ALU_DEC) { hasDec = true; break; }
-            if (!hasDec) continue;
-            for (const auto &l : s.leaves)
-                if (l.kind == libsidplayfp::LK_IMMEDIATE)
-                {
-                    wr_u16(f, kv.first);     // divider cell address
-                    wr_u8(f, l.value);       // reload immediate
-                    wr_u8(f, 0);
-                    ncand++;
-                    break;
-                }
+            // immediate (an LK_IMMEDIATE leaf) -- the reload constant. Scan the
+            // cell's variants (any store/RMW site that decrements + reloads).
+            bool emitted = false;
+            for (const auto &var : kv.second.variants)
+            {
+                const libsidplayfp::SiddfSummary &s = var.value;
+                bool hasDec = false;
+                for (uint8_t op : s.opSeq)
+                    if (op == libsidplayfp::ALU_DEC) { hasDec = true; break; }
+                if (!hasDec) continue;
+                for (const auto &l : s.leaves)
+                    if (l.kind == libsidplayfp::LK_IMMEDIATE)
+                    {
+                        wr_u16(f, kv.first);     // divider cell address
+                        wr_u8(f, l.value);       // reload immediate
+                        wr_u8(f, 0);
+                        ncand++;
+                        emitted = true;
+                        break;
+                    }
+                if (emitted) break;
+            }
         }
         long end = ftell(f);
         fseek(f, nPos, SEEK_SET);

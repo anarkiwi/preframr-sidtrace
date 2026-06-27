@@ -33,7 +33,9 @@ from sidtrace_records import (  # noqa: E402
     ACC_EXEC_PLAY,
     ACC_READ_PLAY,
     ACC_WRITE_PLAY,
+    ALU_ADC,
     ALU_INC,
+    ALU_SBC,
     LK_IMMEDIATE,
     LK_STATE_CELL,
     SIDWR_DT,
@@ -113,7 +115,7 @@ def test_distill_is_tiny(trace):
 
 def test_distill_parses_and_is_well_formed(trace):
     d = parse_sdst(trace["distill"])
-    assert d["version"] == 1
+    assert d["version"] == 2
     assert d["cycles_per_frame"] > 0
     # The access-type map saw code execution (the player ran) and data writes.
     assert (d["acc"] & ACC_EXEC_PLAY).any(), "no code executed during play"
@@ -319,22 +321,22 @@ def test_stateseq_full_length_one_sample_per_frame(tmp_path, fixture_sid):
     assert da["stateseq"] and db["stateseq"], "no STATESEQ sample sequences emitted"
     # full-length: at the longer window the per-cell sample count must grow past the
     # old 512 cap -- it now covers the whole capture, not a fixed window.
-    assert max(e["n_samples"] for e in db["stateseq"]) > 512, (
-        "STATESEQ did not grow past the old 512 cap -- the window-cap was not lifted"
-    )
+    assert (
+        max(e["n_samples"] for e in db["stateseq"]) > 512
+    ), "STATESEQ did not grow past the old 512 cap -- the window-cap was not lifted"
     # one sample per play-call: n_samples never exceeds the captured frame count and
     # grows with the window (O(frames)).
     by_addr_a = {e["addr"]: e["n_samples"] for e in da["stateseq"]}
     by_addr_b = {e["addr"]: e["n_samples"] for e in db["stateseq"]}
     for addr in set(by_addr_a) & set(by_addr_b):
-        assert by_addr_b[addr] >= by_addr_a[addr], (
-            f"cell ${addr:04x} sample count shrank with a longer window"
-        )
+        assert (
+            by_addr_b[addr] >= by_addr_a[addr]
+        ), f"cell ${addr:04x} sample count shrank with a longer window"
     # within the u16 emit-field ceiling, and consistent with one-sample-per-frame
     # (never more samples than play-calls in the 800-frame window).
-    assert all(e["n_samples"] <= 800 for e in db["stateseq"]), (
-        "a cell was sampled more than once per play-call (leaf over-sampling)"
-    )
+    assert all(
+        e["n_samples"] <= 800 for e in db["stateseq"]
+    ), "a cell was sampled more than once per play-call (leaf over-sampling)"
     assert all(e["n_samples"] <= 0xFFFF for e in db["stateseq"])
 
 
@@ -343,30 +345,42 @@ def test_sdcu_present_for_state_cell_update(trace):
     the cell was recomputed, the data the SID-write slice could not give (the cell is
     a leaf there). The fixture's RAM counter is INC'd every play-call; its SDCU entry
     must be the self-feedback accumulator recurrence s' = s+1: an INC op with the cell
-    itself as a (state) leaf. Keyed by the cell ADDRESS, so O(state cells)."""
+    itself as a (state) leaf. Keyed by the cell ADDRESS, so O(state cells). The base
+    fixture is straight-line: each cell is a SINGLE variant with ZERO guards (the
+    branch-structure back-compat case)."""
     d = parse_sdst(trace["distill"])
     assert d["sdcu"], "no SDCU update DAGs emitted"
-    # every SDCU cell is a SIDDF-flagged state cell (the emit filter)
+    # every SDCU cell is a SIDDF-flagged state cell (the base fixture has no guards
+    # so the generator DAG seeds purely from the SID-write state leaves)
     siddf_state = {
         a for e in d["siddf"] for k, a, _v in e["leaves"] if k == LK_STATE_CELL
     }
-    sdcu_addrs = {e["pc"] for e in d["sdcu"]}  # pc field holds the cell addr
+    sdcu_addrs = {e["cell"] for e in d["sdcu"]}
     assert sdcu_addrs <= siddf_state, (
         f"SDCU cells {sorted(sdcu_addrs)} must be SIDDF state cells "
         f"{sorted(siddf_state)}"
     )
+    # back-compat: straight-line cells are one variant, zero guards.
+    for e in d["sdcu"]:
+        assert len(e["variants"]) == 1, "base fixture cell should be straight-line"
+        assert not e["variants"][0]["guards"], "straight-line cell must have no guards"
     # the counter cell's update DAG is the s'=s+1 accumulator: INC + self-leaf.
-    counter = next(iter(d["sdcu"]))
-    assert (
-        ALU_INC in counter["op_seq"]
-    ), f"counter update DAG is not an INC accumulator: ops={counter['op_seq']}"
-    assert any(
-        a == counter["pc"] for _k, a, _v in counter["leaves"]
-    ), "the accumulator's own cell must be a self-feedback leaf of its update"
+    counter = None
+    for e in d["sdcu"]:
+        var = e["variants"][0]
+        if ALU_INC in var["op_seq"] and any(
+            a == e["cell"] for _k, a, _v in var["leaves"]
+        ):
+            counter = e
+            break
+    assert counter is not None, (
+        "no INC self-feedback accumulator cell in SDCU "
+        f"{[(hex(e['cell']), e['variants'][0]['op_seq']) for e in d['sdcu']]}"
+    )
 
 
 def test_sdcu_carries_midcall_valseq(trace):
-    """Stage 3b: every SDCU entry carries the cell's MID-CALL value sequence (the
+    """Stage 3b: every SDCU variant carries the cell's MID-CALL value sequence (the
     value its in-call UPDATE wrote, sampled at the update site -- NOT at the call
     boundary). This is the genuine generator state stream the host feeds to
     Berlekamp-Massey for the LFSR-vs-not verdict (a fast SMC cell's call-boundary
@@ -375,14 +389,14 @@ def test_sdcu_carries_midcall_valseq(trace):
     d = parse_sdst(trace["distill"])
     assert d["sdcu"], "no SDCU update DAGs emitted"
     for e in d["sdcu"]:
-        vs = e.get("val_seq", [])
-        assert isinstance(vs, list)
-        assert len(vs) <= 512, "SDCU value sequence exceeds the bound"
-    # at least one SDCU cell carries a non-trivial value sequence (the counter)
-    assert any(len(e.get("val_seq", [])) >= 2 for e in d["sdcu"]), (
-        "no SDCU cell carried a mid-call value sequence"
-    )
-
+        for var in e["variants"]:
+            vs = var.get("val_seq", [])
+            assert isinstance(vs, list)
+            assert len(vs) <= 512, "SDCU value sequence exceeds the bound"
+    # at least one SDCU variant carries a non-trivial value sequence (the counter)
+    assert any(
+        len(var.get("val_seq", [])) >= 2 for e in d["sdcu"] for var in e["variants"]
+    ), "no SDCU cell carried a mid-call value sequence"
 
 
 def test_sddf_has_no_valseq(trace):
@@ -409,14 +423,27 @@ def test_sdcu_flat_vs_capture_length(tmp_path, fixture_sid):
 
     def sdcu_entries(distill_path):
         d = parse_sdst(distill_path)
-        # key by cell addr; record (structural-signature, valseq-len)
+        # key by (cell, store_pc); record (structural-signature, valseq-len)
         out = {}
         for e in d["sdcu"]:
-            struct_sig = (
-                tuple(e["op_seq"]), tuple(e["leaves"]), e["has_stride"],
-                e["stride_base"], e["stride_idx_min"], e["stride_idx_max"],
-            )
-            out[e["pc"]] = (struct_sig, len(e.get("val_seq", [])))
+            for var in e["variants"]:
+                guard_sig = tuple(
+                    (g["cmp"], g["sense"], g["imm"], tuple(g["leaves"]))
+                    for g in var["guards"]
+                )
+                struct_sig = (
+                    tuple(var["op_seq"]),
+                    tuple(var["leaves"]),
+                    var["has_stride"],
+                    var["stride_base"],
+                    var["stride_idx_min"],
+                    var["stride_idx_max"],
+                    guard_sig,
+                )
+                out[(e["cell"], var["store_pc"])] = (
+                    struct_sig,
+                    len(var.get("val_seq", [])),
+                )
         return out
 
     def trace_n(prefix, n):
@@ -432,16 +459,16 @@ def test_sdcu_flat_vs_capture_length(tmp_path, fixture_sid):
     b = sdcu_entries(trace_n(tmp_path / "s_b", 2400))
     common = set(a) & set(b)
     assert common, "no common SDCU cells across capture lengths"
-    for addr in common:
+    for key in common:
         # STRUCTURAL part is invariant (the update DAG is the recurrence)
-        assert a[addr][0] == b[addr][0], (
-            f"SDCU update DAG of ${addr:04x} changed with capture length"
-        )
+        assert (
+            a[key][0] == b[key][0]
+        ), f"SDCU update DAG of {key} changed with capture length"
         # value sequence is bounded by the cap and (past saturation) does not grow
-        assert a[addr][1] <= SDCU_VALSEQ_M and b[addr][1] <= SDCU_VALSEQ_M
-        assert a[addr][1] == b[addr][1], (
-            f"SDCU value sequence of ${addr:04x} grew with capture length past "
-            f"saturation -- must be bounded/flat: {a[addr][1]} vs {b[addr][1]}"
+        assert a[key][1] <= SDCU_VALSEQ_M and b[key][1] <= SDCU_VALSEQ_M
+        assert a[key][1] == b[key][1], (
+            f"SDCU value sequence of {key} grew with capture length past "
+            f"saturation -- must be bounded/flat: {a[key][1]} vs {b[key][1]}"
         )
 
 
@@ -484,9 +511,7 @@ def smc_sid(tmp_path_factory):
 def smc_trace(tmp_path_factory, smc_sid):
     d = tmp_path_factory.mktemp("smc_trace")
     prefix = d / "out"
-    subprocess.run(
-        [_sidtrace_bin(), str(smc_sid), "1", "200", str(prefix)], check=True
-    )
+    subprocess.run([_sidtrace_bin(), str(smc_sid), "1", "200", str(prefix)], check=True)
     return {"distill": Path(f"{prefix}.distill.bin")}
 
 
@@ -519,24 +544,27 @@ def test_smc_operand_emits_sdcu_and_stateseq(smc_trace):
     # set, which is then closed under each emitted cell's own update-slice leaves --
     # so a generator feeding ANOTHER generator (not a SID register) is emitted too.
     seed = {a for e in d["siddf"] for k, a, _v in e["leaves"] if k == LK_STATE_CELL}
-    sdcu_cells = {e["pc"] for e in d["sdcu"]}
+    sdcu_cells = {e["cell"] for e in d["sdcu"]}
     stsq_cells = {e["addr"] for e in d["stateseq"]}
     assert seed <= sdcu_cells, "SID-write state leaves missing from the SDCU DAG"
     assert seed <= stsq_cells, "SID-write state leaves missing from STATESEQ"
-    # the emitted DAG is self-contained: every state-cell leaf of an emitted SDCU is
-    # itself emitted as a generator, or is at least observable via STATESEQ (a
-    # terminal cell with no captured update) -- nothing reachable is silently dropped.
+    # the emitted DAG is self-contained: every state-cell leaf (value OR guard) of an
+    # emitted SDCU variant is itself emitted as a generator, or is at least observable
+    # via STATESEQ (a terminal cell with no captured update) -- nothing reachable is
+    # silently dropped.
     for e in d["sdcu"]:
-        for k, a, _v in e["leaves"]:
-            if k == LK_STATE_CELL:
-                assert a in sdcu_cells or a in stsq_cells, (
-                    f"state-cell leaf ${a:04x} dropped from the generator closure"
-                )
+        for var in e["variants"]:
+            guard_leaves = [l for g in var["guards"] for l in g["leaves"]]
+            for k, a, _v in list(var["leaves"]) + guard_leaves:
+                if k == LK_STATE_CELL:
+                    assert (
+                        a in sdcu_cells or a in stsq_cells
+                    ), f"state-cell leaf ${a:04x} dropped from the generator closure"
     # the operand cell's STATESEQ tracks the generator (here a +1 counter walk).
     samples = d["stateseq"][0]["samples"]
-    assert len(samples) >= 2 and len(set(samples)) >= 2, (
-        "STATESEQ did not capture the operand's inter-frame variation"
-    )
+    assert (
+        len(samples) >= 2 and len(set(samples)) >= 2
+    ), "STATESEQ did not capture the operand's inter-frame variation"
 
 
 def test_smc_operand_sdcu_dag_invariant_stateseq_full_length(tmp_path, smc_sid):
@@ -546,14 +574,16 @@ def test_smc_operand_sdcu_dag_invariant_stateseq_full_length(tmp_path, smc_sid):
     STATESEQ inter-frame SAMPLE sequence, by contrast, is now FULL-LENGTH (one
     sample per play-call): it must GROW with the window, not saturate at the old
     512 cap -- that is the window-cap lift this change is for."""
+
     def cells(prefix, n):
         subprocess.run(
             [_sidtrace_bin(), str(smc_sid), "1", str(n), str(prefix)], check=True
         )
         d = parse_sdst(Path(f"{prefix}.distill.bin"))
         sdcu = {
-            e["pc"]: (tuple(e["op_seq"]), tuple(e["leaves"]))
+            (e["cell"], var["store_pc"]): (tuple(var["op_seq"]), tuple(var["leaves"]))
             for e in d["sdcu"]
+            for var in e["variants"]
         }
         nstseq = {e["addr"]: e["n_samples"] for e in d["stateseq"]}
         return sdcu, nstseq
@@ -562,22 +592,22 @@ def test_smc_operand_sdcu_dag_invariant_stateseq_full_length(tmp_path, smc_sid):
     b_sdcu, b_st = cells(tmp_path / "b", 1200)
     common = set(a_sdcu) & set(b_sdcu)
     assert common, "no common SMC SDCU cells across capture lengths"
-    for addr in common:
-        assert a_sdcu[addr] == b_sdcu[addr], (
-            f"SMC operand ${addr:04x} update DAG changed with capture length"
-        )
+    for key in common:
+        assert (
+            a_sdcu[key] == b_sdcu[key]
+        ), f"SMC operand {key} update DAG changed with capture length"
     # STATESEQ is full-length now: a cell live across the whole capture has more
     # samples in the longer window (O(frames)), never fewer, and never more than the
     # captured frame count (one sample per play-call), within the u16 ceiling.
     common_st = set(a_st) & set(b_st)
     assert common_st, "no common STATESEQ cells across capture lengths"
     for addr in common_st:
-        assert b_st[addr] >= a_st[addr], (
-            f"STATESEQ ${addr:04x} shrank with a longer window"
-        )
-        assert a_st[addr] <= 600 and b_st[addr] <= 1200, (
-            "STATESEQ exceeded the captured frame count (leaf over-sampling)"
-        )
+        assert (
+            b_st[addr] >= a_st[addr]
+        ), f"STATESEQ ${addr:04x} shrank with a longer window"
+        assert (
+            a_st[addr] <= 600 and b_st[addr] <= 1200
+        ), "STATESEQ exceeded the captured frame count (leaf over-sampling)"
         assert b_st[addr] <= 0xFFFF
     # at least one cell actually grew past the old 512 cap (proves the lift).
     assert max(b_st.values()) > 512, "STATESEQ did not grow past the old 512 cap"
@@ -846,9 +876,9 @@ def test_sstr_steady_structure_after_settle(relocating_sid, tmp_path):
         and 0x1000 <= r["pc"] < 0x1100
     ]
     bases = {r["base"] for r in player_tables}
-    assert 0x1140 in bases, (
-        f"steady structure base must be the RUNTIME table $1140, got {sorted(hex(b) for b in bases)}"
-    )
+    assert (
+        0x1140 in bases
+    ), f"steady structure base must be the RUNTIME table $1140, got {sorted(hex(b) for b in bases)}"
     assert 0x1100 not in bases, (
         "steady structure must NOT name the static-image source $1100 -- the "
         "derivation must observe the post-relocation runtime base"
@@ -867,7 +897,9 @@ def test_settle_is_additive_sidwr_unaffected(tmp_path, fixture_sid):
     d = parse_sdst(Path(f"{prefix}.distill.bin"))
     sw = load_sidwr(Path(f"{prefix}.sidwr.bin"))
     total = sum(c for _pc, _reg, c, _v in d["sid_writes"])
-    assert total == sw.size, "SID-write summary diverged from sidwr (settle not additive)"
+    assert (
+        total == sw.size
+    ), "SID-write summary diverged from sidwr (settle not additive)"
 
 
 def test_settle_section_flat_vs_capture_length(tmp_path, fixture_sid):
@@ -891,9 +923,9 @@ def test_settle_section_flat_vs_capture_length(tmp_path, fixture_sid):
 
     short = trace_n(tmp_path / "sshort", 60)
     long = trace_n(tmp_path / "slong", 600)
-    assert setl_sstr_nbytes(short) == setl_sstr_nbytes(long), (
-        "SETL+SSTR size grew with capture length -- must be flat vs frames"
-    )
+    assert setl_sstr_nbytes(short) == setl_sstr_nbytes(
+        long
+    ), "SETL+SSTR size grew with capture length -- must be flat vs frames"
 
 
 # --- VEVT (per-voice post-settle note timeline) -----------------------------
@@ -950,6 +982,195 @@ def test_vevt_onsets_carry_distinct_table_freqs(note_gate_trace):
 def test_vevt_flat_across_subtune_with_no_gate_edges(trace):
     """The default fixture holds gate constant -> no spurious VEVT events."""
     d = parse_sdst(trace["distill"])
-    assert d["voice_events"] == [] or all(
-        not v["events"] for v in d["voice_events"]
+    assert d["voice_events"] == [] or all(not v["events"] for v in d["voice_events"])
+
+
+# ===================================================================
+# SDCU BRANCH STRUCTURE (guarded single-branch variants; design 3).
+#
+# A branch-conditioned state-cell update (triangle PW/vibrato sweep, table-jump)
+# is split by STORE SITE into guarded variants: each store PC is one straight-
+# line recurrence (its value slice recorded ONCE, so op_seq is the true single-
+# frame chain, not the cross-frame {ADC,SBC} union) plus the GUARD chain that
+# control-depends it. The make_branch_update_sid fixture deterministically sweeps
+# a pulse-width shadow up (ADC) / down (SBC) selected by a free-running counter's
+# high bit -- a synthetic triangle, no HVSC. A live dmc/Faces anchor backs it up
+# when the tune + C64 ROMs are present.
+# ===================================================================
+
+
+@pytest.fixture(scope="session")
+def branch_sid(tmp_path_factory):
+    d = tmp_path_factory.mktemp("branch_sid")
+    sid = d / "branch.sid"
+    subprocess.run(
+        [sys.executable, str(HERE / "make_branch_update_sid.py"), str(sid)],
+        check=True,
     )
+    assert sid.stat().st_size > 0
+    return sid
+
+
+@pytest.fixture(scope="session")
+def branch_trace(tmp_path_factory, branch_sid):
+    d = tmp_path_factory.mktemp("branch_trace")
+    prefix = d / "out"
+    # >256 frames so both the up (cnt<128) and down (cnt>=128) halves fire.
+    subprocess.run(
+        [_sidtrace_bin(), str(branch_sid), "1", "400", str(prefix)], check=True
+    )
+    return parse_sdst(Path(f"{prefix}.distill.bin"))
+
+
+def _guard_cells(variant):
+    return {
+        a for g in variant["guards"] for k, a, _v in g["leaves"] if k == LK_STATE_CELL
+    }
+
+
+def test_sdcu_branch_two_variants_distinct_ops(branch_trace):
+    """The swept pulse-width shadow has >=2 variants: an ADC (up) variant and an SBC
+    (down) variant. NO variant op_seq MIXES ADC and SBC -- each is a single-frame
+    chain, the cross-frame union artefact is gone."""
+    d = branch_trace
+    assert d["sdcu"], "no SDCU update DAGs emitted"
+    guarded = [e for e in d["sdcu"] if len(e["variants"]) >= 2]
+    assert guarded, "no branch-conditioned (multi-variant) SDCU cell"
+    pw = max(guarded, key=lambda e: len(e["variants"]))
+    ops = [set(v["op_seq"]) for v in pw["variants"]]
+    assert any(ALU_ADC in o for o in ops), ops
+    assert any(ALU_SBC in o for o in ops), ops
+    for o in ops:
+        assert not (
+            ALU_ADC in o and ALU_SBC in o
+        ), f"a variant op_seq still mixes ADC and SBC (union not split): {ops}"
+
+
+def test_sdcu_branch_variants_guarded_on_common_toggle(branch_trace):
+    """Each variant is guarded on a COMMON toggle cell, and that toggle cell is
+    itself an emitted straight-line +1 counter (the predicate closure pulled it into
+    the generator DAG even though it feeds no SID write directly)."""
+    d = branch_trace
+    pw = max(
+        (e for e in d["sdcu"] if len(e["variants"]) >= 2),
+        key=lambda e: len(e["variants"]),
+    )
+    per = []
+    for v in pw["variants"]:
+        assert v["guards"], "branch variant carries no guard"
+        per.append(_guard_cells(v))
+    common = set.intersection(*per) if per else set()
+    assert common, f"variants not guarded on a common toggle cell: {per}"
+    toggle = sorted(common)[0]
+    # the toggle cell is itself an emitted straight-line counter: one variant, INC,
+    # no guards (the back-compat straight-line shape).
+    tog = next((e for e in d["sdcu"] if e["cell"] == toggle), None)
+    assert (
+        tog is not None
+    ), f"toggle ${toggle:04x} not emitted -- predicate closure failed"
+    assert (
+        len(tog["variants"]) == 1 and not tog["variants"][0]["guards"]
+    ), "the toggle cell is not a straight-line generator"
+    assert ALU_INC in tog["variants"][0]["op_seq"], "the toggle cell is not a counter"
+    # and it is a constant-stride counter in STSQ (holds_to_end).
+    st = next((e for e in d["stateseq"] if e["addr"] == toggle), None)
+    assert (
+        st is not None and st["holds_to_end"]
+    ), "toggle counter not present in STSQ as a +1 accumulator"
+
+
+def test_sdcu_branch_variant_opseq_invariant(tmp_path, branch_sid):
+    """Each variant's op_seq is byte-identical across a short and a long window --
+    the regression for the old union/multiplicity artefact (op_seq grew with the
+    first-N-walk count). Both windows are >256 frames so both variants are present."""
+
+    def variants(n):
+        prefix = tmp_path / f"w{n}"
+        subprocess.run(
+            [_sidtrace_bin(), str(branch_sid), "1", str(n), str(prefix)], check=True
+        )
+        d = parse_sdst(Path(f"{prefix}.distill.bin"))
+        return {
+            (e["cell"], v["store_pc"]): tuple(v["op_seq"])
+            for e in d["sdcu"]
+            for v in e["variants"]
+        }
+
+    a = variants(300)
+    b = variants(600)
+    common = set(a) & set(b)
+    assert common, "no common SDCU variants across capture lengths"
+    for key in common:
+        assert (
+            a[key] == b[key]
+        ), f"variant {key} op_seq changed with window: {a[key]} vs {b[key]}"
+
+
+def test_sdcu_back_compat_straight_line_single_variant(branch_trace):
+    """Back-compat: a straight-line cell (the free-running counter) emits exactly one
+    variant with zero guards -- identical in shape to the pre-branch-structure SDCU."""
+    d = branch_trace
+    straight = [
+        e
+        for e in d["sdcu"]
+        if len(e["variants"]) == 1 and not e["variants"][0]["guards"]
+    ]
+    assert straight, "no straight-line (single-variant, zero-guard) SDCU cell"
+    assert any(
+        ALU_INC in e["variants"][0]["op_seq"] for e in straight
+    ), "the +1 counter must be a straight-line single variant"
+
+
+# --- live dmc/Faces triangle PW sweep (ROM + tune gated; skips in CI) --------
+_FACES_SID = Path(
+    "/scratch/anarkiwi/cbm/deplayroutine/tests/.tunecache/targets/dmc/tunes/Faces.sid"
+)
+
+
+def _c64_roms():
+    bases = (
+        os.environ.get("C64_ROM_DIR"),
+        "/usr/local/share/vice/C64",
+        "/usr/share/vice/C64",
+    )
+    for base in bases:
+        if not base:
+            continue
+        k = Path(base) / "kernal-901227-03.bin"
+        b = Path(base) / "basic-901226-01.bin"
+        c = Path(base) / "chargen-901225-01.bin"
+        if k.exists() and b.exists() and c.exists():
+            return [str(k), str(b), str(c)]
+    return None
+
+
+def test_faces_triangle_pw_sweep_variants(tmp_path):
+    """Live anchor: dmc/Faces 0x1750 -> v1.pw_lo is a triangle PW sweep. It must
+    split into >=2 variants with an ADC (up) and an SBC (down) chain guarded on a
+    common toggle cell, and the up variant must NO LONGER carry the SBC frames (the
+    folded {ADC,SBC} union the old single-summary SDCU emitted)."""
+    if not _FACES_SID.exists():
+        pytest.skip("dmc/Faces tune not available")
+    roms = _c64_roms()
+    if roms is None:
+        pytest.skip("C64 ROMs not available")
+    prefix = tmp_path / "faces"
+    subprocess.run(
+        [_sidtrace_bin(), str(_FACES_SID), "1", "800", str(prefix), *roms], check=True
+    )
+    d = parse_sdst(Path(f"{prefix}.distill.bin"))
+    pw = next((e for e in d["sdcu"] if e["cell"] == 0x1750), None)
+    assert pw is not None, "Faces 0x1750 pw_lo cell not emitted"
+    assert len(pw["variants"]) >= 2, "0x1750 not split into branch variants"
+    ops = [set(v["op_seq"]) for v in pw["variants"]]
+    assert any(ALU_ADC in o for o in ops), ops
+    assert any(ALU_SBC in o for o in ops), ops
+    # the union artefact is gone: at least one variant is ADC without SBC.
+    assert any(
+        ALU_ADC in o and ALU_SBC not in o for o in ops
+    ), f"every 0x1750 variant still mixes ADC/SBC -- union not split: {ops}"
+    # the two variants share a common guard (toggle) cell.
+    per = [_guard_cells(v) for v in pw["variants"] if v["guards"]]
+    assert len(per) >= 2 and set.intersection(
+        *per
+    ), "0x1750 variants lack a common guard cell"

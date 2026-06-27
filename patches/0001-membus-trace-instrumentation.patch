@@ -254,10 +254,10 @@ index 691ab7f8..e82f4a3b 100644
          if (addr >= 0x0400 && addr <= 0x07ff)
 diff --git a/src/c64/membus_trace.h b/src/c64/membus_trace.h
 new file mode 100644
-index 00000000..f1e15528
+index 00000000..dbc47788
 --- /dev/null
 +++ b/src/c64/membus_trace.h
-@@ -0,0 +1,2284 @@
+@@ -0,0 +1,2673 @@
 +/*
 + * membus_trace.h - in-emulator DISTILLER for white-box SID recovery.
 + * Not part of upstream libsidplayfp. Scratch use only.
@@ -525,6 +525,27 @@ index 00000000..f1e15528
 +    ALU_CMP,        // compare (control-edge predicate)
 +};
 +
++// Comparison kind a guard's predicate resolves to (SDCU branch-structure,
++// design 3). The branch OUTCOME is implicit in the executed-PC trajectory (next
++// retired PC = taken target vs fall-through), so no flag tracking is needed;
++// cmpOp is the SEMANTIC predicate that holds when the guarded store fires,
++// derived from (tested flag, branch opcode, observed sense, flag-defining op).
++enum CmpOp : uint8_t
++{
++    CMP_NONE = 0,
++    CMP_EQ,         // tested == immediate (or == 0)        [Z set]
++    CMP_NE,         // tested != immediate (or != 0)        [Z clear]
++    CMP_LT,         // tested <  immediate (unsigned)       [C clear after CMP]
++    CMP_GE,         // tested >= immediate (unsigned)       [C set after CMP]
++    CMP_MI,         // tested negative (bit7 set)           [N set]
++    CMP_PL,         // tested non-negative (bit7 clear)     [N clear]
++    CMP_BIT_SET,    // (BIT) tested bit set                 [N/V set, Z clear]
++    CMP_BIT_CLR,    // (BIT) tested bit clear               [N/V clear, Z set]
++    CMP_VS,         // overflow set                         [V set]
++    CMP_VC,         // overflow clear                       [V clear]
++    CMP_UNRESOLVED, // guard could not be resolved within the cap
++};
++
 +// Leaf classification of a slice leaf (design 3.1 / 2.3).
 +enum LeafKind : uint8_t
 +{
@@ -660,6 +681,39 @@ index 00000000..f1e15528
 +    std::vector<Addend> addends;     // contributing (op, addend-cell) pairs
 +};
 +
++// --- SDCU branch-structure (guarded single-branch variants; design 3) -------
++// A state cell's in-call update is split by STORE SITE into variants: each
++// distinct store PC that defines the cell within a play-call is one straight-
++// line recurrence. Its value slice is recorded ONCE (the cross-frame union is
++// dropped), so op_seq is the true single-frame chain. Each variant also carries
++// the GUARD chain (innermost first) that control-depends its store on the
++// executed path -- the predicate the recoverer evaluates to know which variant
++// fires. A cell with one variant and no guards is exactly the old straight-line
++// SDCU (back-compatible). Bounded MAX_VARIANTS x MAX_GUARDS, flat vs frames.
++struct Guard
++{
++    uint8_t  cmpOp = CMP_UNRESOLVED;  // CmpOp: predicate that holds when the store fires
++    uint8_t  sense = 0;               // 1 = store on the branch's TAKEN side, 0 = fall-through
++    uint8_t  immediate = 0;           // compared constant (if the flag-def took a #imm operand)
++    bool     unresolved = false;      // guard not resolvable within the cap
++    std::vector<SiddfLeaf> leaves;    // predicate slice (state_cell / ram / immediate)
++};
++
++struct CellVariant
++{
++    uint16_t storePc = 0;             // the STA/STX/STY/RMW site (the variant id)
++    SiddfSummary value;               // value slice: op_seq + leaves + strided interval + val
++    std::vector<Guard> guards;        // innermost first, bounded MAX_GUARDS
++    uint32_t count = 0;               // frames this variant fired (provenance)
++    bool     guardsCaptured = false;  // guard chain sliced once (first occurrence)
++};
++
++struct CellUpdate
++{
++    uint16_t cell = 0;
++    std::vector<CellVariant> variants;  // bounded MAX_VARIANTS
++};
++
 +class MemBusTrace
 +{
 +public:
@@ -727,7 +781,15 @@ index 00000000..f1e15528
 +    // `reg` field of the record is unused; the key is the cell address. We also
 +    // remember which SID register(s) read this cell so the host can attribute the
 +    // recovered update to the axis it drives.
-+    std::map<uint16_t, SiddfSummary> sdcu;
++    //
++    // BRANCH STRUCTURE (design 3): keyed by cell address but split by store site
++    // into guarded single-branch variants (CellUpdate.variants). Bounded:
++    // MAX_VARIANTS store sites per cell, MAX_GUARDS enclosing guards per variant,
++    // MAX_GUARD_LEAVES leaves per guard. Flat vs frame count.
++    static constexpr uint32_t MAX_VARIANTS     = 4;
++    static constexpr uint32_t MAX_GUARDS       = 3;
++    static constexpr uint32_t MAX_GUARD_LEAVES = 16;
++    std::map<uint16_t, CellUpdate> sdcu;
 +
 +    // STATESEQ: per-candidate-state-cell inter-frame sample sequence (design 3.2).
 +    // Keyed by RAM address. Populated once per play-call (frame) for every address
@@ -1792,6 +1854,93 @@ index 00000000..f1e15528
 +        return false;
 +    }
 +
++    // ----- SDCU guard helpers: conditional branches + flag-setting (design 3) --
++    // Is the opcode a conditional branch (Bcc)? The taken/not-taken OUTCOME is
++    // read from the executed-PC trajectory, not from a tracked flag.
++    static inline bool isBranch(uint8_t op)
++    {
++        switch (op)
++        {
++        case 0x10: case 0x30: case 0x50: case 0x70:             // BPL/BMI/BVC/BVS
++        case 0x90: case 0xB0: case 0xD0: case 0xF0:             // BCC/BCS/BNE/BEQ
++            return true;
++        }
++        return false;
++    }
++    static inline bool isBitOp(uint8_t op) { return op == 0x24 || op == 0x2C; }
++
++    // The processor flag a branch tests: 0 = Z, 1 = N, 2 = C, 3 = V.
++    static inline uint8_t branchFlag(uint8_t op)
++    {
++        switch (op)
++        {
++        case 0x10: case 0x30: return 1;   // N (BPL/BMI)
++        case 0x50: case 0x70: return 3;   // V (BVC/BVS)
++        case 0x90: case 0xB0: return 2;   // C (BCC/BCS)
++        default:              return 0;    // Z (BNE/BEQ)
++        }
++    }
++    // The flag VALUE under which the branch is TAKEN.
++    static inline bool branchTakenFlagValue(uint8_t op)
++    {
++        switch (op)
++        {
++        case 0x30: case 0x70: case 0xB0: case 0xF0: return true;  // BMI/BVS/BCS/BEQ
++        default:                                     return false; // BPL/BVC/BCC/BNE
++        }
++    }
++    // Does the opcode SET the named flag (so it can be a guard's flag-definer)?
++    static inline bool setsZN(uint8_t op)
++    {
++        if (isStore(op)) return false;
++        return defReg(op) != SR_NONE || aluOp(op) != ALU_NONE || isBitOp(op);
++    }
++    static inline bool setsC(uint8_t op)
++    {
++        const uint8_t a = aluOp(op);
++        if (a == ALU_CMP || a == ALU_ADC || a == ALU_SBC ||
++            a == ALU_ASL || a == ALU_LSR || a == ALU_ROL || a == ALU_ROR)
++            return true;
++        return op == 0x18 || op == 0x38;   // CLC / SEC
++    }
++    static inline bool setsV(uint8_t op)
++    {
++        const uint8_t a = aluOp(op);
++        if (a == ALU_ADC || a == ALU_SBC) return true;
++        return isBitOp(op) || op == 0xB8 || op == 0x28;   // BIT / CLV / PLP
++    }
++    static inline bool setsFlag(uint8_t op, uint8_t flag)
++    {
++        switch (flag)
++        {
++        case 2:  return setsC(op);
++        case 3:  return setsV(op);
++        default: return setsZN(op);   // Z (0) or N (1)
++        }
++    }
++    // The SEMANTIC predicate that holds (store fires) given the flag-defining op,
++    // the tested flag, and the flag VALUE on the executed path.
++    static inline uint8_t deriveCmp(uint8_t defOp, uint8_t flag, bool flagVal)
++    {
++        const bool bit = isBitOp(defOp);
++        switch (flag)
++        {
++        case 0:   // Z
++            if (bit) return flagVal ? CMP_BIT_CLR : CMP_BIT_SET;  // Z set => (A&mem)==0
++            return flagVal ? CMP_EQ : CMP_NE;
++        case 1:   // N
++            if (bit) return flagVal ? CMP_BIT_SET : CMP_BIT_CLR;  // bit7
++            return flagVal ? CMP_MI : CMP_PL;
++        case 2:   // C
++            if (aluOp(defOp) == ALU_CMP) return flagVal ? CMP_GE : CMP_LT;
++            return CMP_UNRESOLVED;   // carry from adc/sbc/shift is not an ordering predicate
++        case 3:   // V
++            if (bit) return flagVal ? CMP_BIT_SET : CMP_BIT_CLR;  // bit6
++            return flagVal ? CMP_VS : CMP_VC;
++        }
++        return CMP_UNRESOLVED;
++    }
++
 +    // Classify a leaf address against the access-type map (design 2.3 / 3.1).
 +    inline uint8_t classifyLeaf(uint16_t addr) const
 +    {
@@ -1909,8 +2058,12 @@ index 00000000..f1e15528
 +        // generatorCells() will emit. sdcu is populated as updates retire, so a
 +        // deep cell's leaves are present by the time its update has been sliced.
 +        for (const auto &kv : sdcu)
-+            for (const auto &l : kv.second.leaves)
-+                sampleLeaf(l.addr);
++            for (const auto &var : kv.second.variants)
++            {
++                for (const auto &l : var.value.leaves) sampleLeaf(l.addr);
++                for (const auto &g : var.guards)
++                    for (const auto &l : g.leaves) sampleLeaf(l.addr);
++            }
 +        frameNo++;
 +    }
 +
@@ -1930,6 +2083,15 @@ index 00000000..f1e15528
 +        for (const auto &l : s.leaves)
 +            if (l.kind == kind && l.addr == addr) return;
 +        s.leaves.push_back(SiddfLeaf{ kind, addr, val });
++    }
++    // Add a leaf into a bare leaf vector (a guard's predicate slice); bounded, dedup.
++    static inline void addLeafVec(std::vector<SiddfLeaf> &v, uint8_t kind,
++                                  uint16_t addr, uint8_t val)
++    {
++        if (v.size() >= MAX_GUARD_LEAVES) return;
++        for (const auto &l : v)
++            if (l.kind == kind && l.addr == addr) return;
++        v.push_back(SiddfLeaf{ kind, addr, val });
 +    }
 +
 +    // Capture the value-defining slice of a just-retired STORE to `addr` (slot
@@ -2000,9 +2162,26 @@ index 00000000..f1e15528
 +    // self-feedback recurrence: cell' = op(cell). The cell is its own leaf (the
 +    // prior value carries between calls), and the op is the recurrence kind. This
 +    // is the canonical counter/accumulator (s' = s +/- 1) and the LFSR shift cell.
++    // Get (or create) the variant for store site `storePc` of cell `cellAddr`.
++    // Bounded to MAX_VARIANTS distinct store sites; returns null past the cap.
++    inline CellVariant *variantFor(uint16_t cellAddr, uint16_t storePc)
++    {
++        CellUpdate &u = sdcu[cellAddr];
++        u.cell = cellAddr;
++        for (auto &v : u.variants)
++            if (v.storePc == storePc) return &v;
++        if (u.variants.size() >= MAX_VARIANTS) return nullptr;
++        u.variants.emplace_back();
++        u.variants.back().storePc = storePc;
++        return &u.variants.back();
++    }
++
 +    inline void recordCellRmw(uint16_t cellAddr, uint8_t op, uint16_t pc)
 +    {
-+        SiddfSummary &s = sdcu[cellAddr];
++        CellVariant *vp = variantFor(cellAddr, pc);
++        if (!vp) return;
++        SiddfSummary &s = vp->value;
++        vp->count++;
 +        s.count++;
 +        addPc(s, pc);
 +        // mid-call value sequence: the cell's value AFTER this RMW retired (the
@@ -2017,7 +2196,9 @@ index 00000000..f1e15528
 +    inline void sliceCellUpdate(uint32_t storeSlot, uint16_t cellAddr)
 +    {
 +        const RetiredInstr st = ring[storeSlot];
-+        SiddfSummary &s = sdcu[cellAddr];
++        CellVariant *vp = variantFor(cellAddr, st.pc);
++        if (!vp) return;
++        SiddfSummary &s = vp->value;
 +        const uint8_t v = st.memVal;
 +        if (!s.valSeen) { s.valFirst = v; s.valSeen = true; }
 +        if (v < s.valLo) s.valLo = v;
@@ -2025,10 +2206,15 @@ index 00000000..f1e15528
 +        // mid-call value sequence (the genuine generator state stream the host
 +        // feeds to Berlekamp-Massey; bounded, flat vs frames)
 +        if (s.valSeq.size() < SiddfSummary::SDCU_VALSEQ_M) s.valSeq.push_back(v);
++        vp->count++;
 +        s.count++;
 +        addPc(s, st.pc);
-+        if (s.count > 32) return;             // shape invariant; refine cheaply only
-+        const bool firstWalk = (s.count <= 4);
++        // The value slice + guard chain are a SINGLE-FRAME property of this store
++        // site, invariant across frames; record them ONCE (drop the cross-frame
++        // union so op_seq is the true single-frame chain). val range / valSeq keep
++        // accumulating (bounded) above.
++        if (s.count > 1) return;
++        const bool firstWalk = true;
 +
 +        const uint32_t windowLen = ringFill < RING_CAP ? ringFill : RING_CAP;
 +        const uint64_t oldestSeq = (ringSeq > windowLen) ? (ringSeq - windowLen) : 0;
@@ -2130,6 +2316,196 @@ index 00000000..f1e15528
 +                break;
 +            }
 +            if (!found) addLeaf(s, LK_OUT_OF_WINDOW, 0, 0);
++        }
++
++        // Capture the guard chain that control-depends this store on the executed
++        // path (innermost first, bounded). Recorded once with the value slice.
++        captureGuards(*vp, storeSlot);
++        vp->guardsCaptured = true;
++    }
++
++    // ----- SDCU guards: control-dependence approximation (design 3.2) ---------
++    // Find the conditional branches that control this store on the EXECUTED path,
++    // innermost first (bounded MAX_GUARDS). The branch outcome is read from the
++    // ring's executed-PC trajectory (next retired PC = taken target vs fall-
++    // through), so no flag tracking is needed. Each guard slices the flag-defining
++    // instruction's tested operand with the same backward slicer used for values.
++    inline void captureGuards(CellVariant &var, uint32_t storeSlot)
++    {
++        const uint32_t windowLen = ringFill < RING_CAP ? ringFill : RING_CAP;
++        uint32_t scanFrom = storeSlot;
++        for (uint32_t g = 0; g < MAX_GUARDS; ++g)
++        {
++            int64_t bslot = -1;
++            uint32_t idx = scanFrom;
++            for (uint32_t steps = 0; steps < windowLen; ++steps)
++            {
++                idx = (idx == 0) ? (RING_CAP - 1) : (idx - 1);
++                const RetiredInstr &in = ring[idx];
++                if (!in.gotOpcode) continue;
++                // Stop at the play-call entry/exit (JSR/RTS/RTI) so an enclosing
++                // guard is never picked up from a PRIOR frame's control flow.
++                if (in.opcode == 0x20 || in.opcode == 0x60 || in.opcode == 0x40) break;
++                if (isBranch(in.opcode)) { bslot = (int64_t)idx; break; }
++            }
++            if (bslot < 0) break;                 // no more controlling branches this call
++            Guard guard;
++            buildGuard(guard, (uint32_t)bslot, windowLen);
++            var.guards.push_back(guard);
++            scanFrom = (uint32_t)bslot;           // continue outward to the next branch
++        }
++    }
++
++    // Build one guard from the conditional branch at ring slot `bslot`: its sense
++    // (taken/fall-through, from the trajectory), the semantic cmpOp, the compared
++    // immediate, and the predicate slice of the flag-defining instruction.
++    inline void buildGuard(Guard &guard, uint32_t bslot, uint32_t windowLen)
++    {
++        const RetiredInstr &br = ring[bslot];
++        const uint16_t fallthrough = (uint16_t)(br.pc + 2);
++        const uint16_t nextPc = ring[(bslot + 1) % RING_CAP].pc;
++        const bool taken = (nextPc != fallthrough);
++        guard.sense = taken ? 1 : 0;
++
++        const uint8_t flag = branchFlag(br.opcode);
++        const bool takenVal = branchTakenFlagValue(br.opcode);
++        const bool flagVal = taken ? takenVal : !takenVal;   // flag value on this path
++
++        int64_t fslot = -1;
++        uint32_t idx = bslot;
++        for (uint32_t steps = 0; steps < windowLen; ++steps)
++        {
++            idx = (idx == 0) ? (RING_CAP - 1) : (idx - 1);
++            const RetiredInstr &in = ring[idx];
++            if (in.gotOpcode && setsFlag(in.opcode, flag)) { fslot = (int64_t)idx; break; }
++        }
++        if (fslot < 0)
++        {
++            guard.unresolved = true;
++            guard.cmpOp = CMP_UNRESOLVED;
++            return;
++        }
++        const RetiredInstr &di = ring[(uint32_t)fslot];
++        guard.cmpOp = deriveCmp(di.opcode, flag, flagVal);
++        if (!readsMem(di.opcode) && di.hasImm) guard.immediate = di.imm;
++        sliceGuardOperand(guard.leaves, (uint32_t)fslot, di, windowLen);
++        if (guard.cmpOp == CMP_UNRESOLVED) guard.unresolved = true;
++    }
++
++    // Slice the flag-defining instruction's tested operand into a guard's leaves,
++    // with the same backward edges the value slicer follows (register def chains,
++    // memory last-writer jumps), bounded and leaf-only.
++    inline void sliceGuardOperand(std::vector<SiddfLeaf> &leaves, uint32_t fslot,
++                                  const RetiredInstr &di, uint32_t windowLen)
++    {
++        const uint64_t oldestSeq = (ringSeq > windowLen) ? (ringSeq - windowLen) : 0;
++        SliceTask wl[64];
++        uint32_t wlHead = 0, wlTail = 0;
++        auto push = [&](SliceTask t) { if (wlTail < 64) wl[wlTail++] = t; };
++        auto immLeaf = [&](const RetiredInstr &in) {
++            if (!in.hasImm) return;
++            if (in.immAddr && isSmcOperandCandidate(in.immAddr))
++                addLeafVec(leaves, LK_RAM_READ, in.immAddr,
++                           ramFn ? ramFn(ramCtx, in.immAddr) : in.imm);
++            else
++                addLeafVec(leaves, LK_IMMEDIATE, 0, in.imm);
++        };
++
++        const uint8_t op = di.opcode;
++        const uint8_t alu = aluOp(op);
++        if (alu == ALU_CMP)
++        {
++            const uint8_t cr = (op == 0xE0 || op == 0xE4 || op == 0xEC) ? SR_X
++                             : (op == 0xC0 || op == 0xC4 || op == 0xCC) ? SR_Y : SR_A;
++            push(SliceTask{ fslot, cr, 0, true });
++            if (readsMem(op) && (di.memRead || di.memWrite))
++            {
++                if (di.idxUsed != SR_NONE) push(SliceTask{ fslot, di.idxUsed, 0, true });
++                push(SliceTask{ fslot, 0, di.memAddr, false });
++            }
++        }
++        else if (isBitOp(op))
++            push(SliceTask{ fslot, 0, di.memAddr, false });
++        else if ((alu == ALU_INC || alu == ALU_DEC || alu == ALU_ASL ||
++                  alu == ALU_LSR || alu == ALU_ROL || alu == ALU_ROR) && di.memWrite)
++            addLeafVec(leaves, LK_RAM_READ, di.memAddr,
++                       ramFn ? ramFn(ramCtx, di.memAddr) : 0);
++        else if (readsMem(op) && (di.memRead || di.memWrite))
++        {
++            if (di.idxUsed != SR_NONE) push(SliceTask{ fslot, di.idxUsed, 0, true });
++            push(SliceTask{ fslot, 0, di.memAddr, false });
++        }
++        else
++        {
++            switch (op)
++            {
++            case 0x8A: push(SliceTask{ fslot, SR_X, 0, true }); break;
++            case 0x98: push(SliceTask{ fslot, SR_Y, 0, true }); break;
++            case 0xAA: case 0xA8: push(SliceTask{ fslot, SR_A, 0, true }); break;
++            default: immLeaf(di); break;
++            }
++        }
++
++        uint32_t resolved = 0;
++        while (wlHead < wlTail && resolved < 128)
++        {
++            SliceTask t = wl[wlHead++];
++            ++resolved;
++            if (!t.isReg)
++            {
++                const uint16_t a = t.mem;
++                const uint64_t wseq = lastWriteSeq[a];
++                if (wseq != 0 && (wseq - 1) >= oldestSeq && (wseq - 1) < ringSeq)
++                {
++                    const uint32_t wslot = lastWriteSlot[a];
++                    if (ring[wslot].ringSeq == (wseq - 1) && ring[wslot].memWrite &&
++                        ring[wslot].memAddr == a)
++                    {
++                        RetiredInstr &w = ring[wslot];
++                        if (isStore(w.opcode))
++                        {
++                            push(SliceTask{ wslot, storeSrcReg(w.opcode), 0, true });
++                            if (w.idxUsed != SR_NONE)
++                                push(SliceTask{ wslot, w.idxUsed, 0, true });
++                        }
++                        else
++                            addLeafVec(leaves, LK_RAM_READ, a,
++                                       ramFn ? ramFn(ramCtx, a) : 0);
++                        continue;
++                    }
++                }
++                addLeafVec(leaves, LK_RAM_READ, a, ramFn ? ramFn(ramCtx, a) : 0);
++                continue;
++            }
++            bool found = false;
++            uint32_t idx = t.anchor;
++            for (uint32_t steps = 0; steps < windowLen; ++steps)
++            {
++                idx = (idx == 0) ? (RING_CAP - 1) : (idx - 1);
++                RetiredInstr &in = ring[idx];
++                const uint8_t dr = defReg(in.opcode);
++                const bool defs = (dr == t.reg) ||
++                                  (t.reg == SR_X && alsoDefsX(in.opcode));
++                if (!defs) continue;
++                found = true;
++                if (readsMem(in.opcode) && (in.memRead || in.memWrite))
++                {
++                    if (in.idxUsed != SR_NONE) push(SliceTask{ idx, in.idxUsed, 0, true });
++                    push(SliceTask{ idx, 0, in.memAddr, false });
++                }
++                else
++                {
++                    switch (in.opcode)
++                    {
++                    case 0x8A: push(SliceTask{ idx, SR_X, 0, true }); break;
++                    case 0x98: push(SliceTask{ idx, SR_Y, 0, true }); break;
++                    case 0xAA: case 0xA8: push(SliceTask{ idx, SR_A, 0, true }); break;
++                    default: immLeaf(in); break;
++                    }
++                }
++                break;
++            }
++            if (!found) addLeafVec(leaves, LK_OUT_OF_WINDOW, 0, 0);
 +        }
 +    }
 +
@@ -2356,9 +2732,14 @@ index 00000000..f1e15528
 +                if (l.kind == LK_RAM_READ)
 +                    l.kind = classifyLeaf(l.addr);
 +        for (auto &kv : sdcu)
-+            for (auto &l : kv.second.leaves)
-+                if (l.kind == LK_RAM_READ)
-+                    l.kind = classifyLeaf(l.addr);
++            for (auto &var : kv.second.variants)
++            {
++                for (auto &l : var.value.leaves)
++                    if (l.kind == LK_RAM_READ) l.kind = classifyLeaf(l.addr);
++                for (auto &g : var.guards)
++                    for (auto &l : g.leaves)
++                        if (l.kind == LK_RAM_READ) l.kind = classifyLeaf(l.addr);
++            }
 +    }
 +
 +    // Is `addr` flagged as a state cell by some SIDDF site (after finalizeLeaves)?
@@ -2399,8 +2780,16 @@ index 00000000..f1e15528
 +            work.pop_back();
 +            auto it = sdcu.find(c);
 +            if (it == sdcu.end()) continue;
-+            for (const auto &l : it->second.leaves)
-+                if (l.kind == LK_STATE_CELL) add(l.addr);
++            for (const auto &var : it->second.variants)
++            {
++                for (const auto &l : var.value.leaves)
++                    if (l.kind == LK_STATE_CELL) add(l.addr);
++                // Close over PREDICATE leaves too: a toggle/divider cell a variant's
++                // guard tests becomes part of the generator DAG (design 3.3).
++                for (const auto &g : var.guards)
++                    for (const auto &l : g.leaves)
++                        if (l.kind == LK_STATE_CELL) add(l.addr);
++            }
 +        }
 +        return out;
 +    }
